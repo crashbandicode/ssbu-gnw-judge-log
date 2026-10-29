@@ -1,0 +1,886 @@
+//! Host-testable half: the hook site, each fighter's recent actions, Judge
+//! detection, the record the hook hands to the writer, and the TSV row.
+//!
+//! Game & Watch keeps the panel of the current Judge in the instance work int
+//! `SPECIAL_S_KIND` (0..=8 for 1..9, -1 when none is showing) and the previous
+//! one in `SPECIAL_S_PREV_KIND`. `FighterSpecializer_GameWatch::init_panel`
+//! (`.text+0xa84470`) copies the first into the second and resets it to -1.
+//! The draw itself runs in G&W's fighter scripts (`lua2cpp_gamewatch`), so the
+//! plugin does not touch it: once per frame it reads the work int and reports
+//! a Judge when a number appears.
+
+use crate::names;
+use core::fmt;
+
+pub const SUPPORTED_VERSION: &str = "13.0.5";
+
+/// An inline hook site and the 64 bytes that must be there (13.0.5 image).
+pub struct Site {
+    pub name: &'static str,
+    pub offset: usize,
+    pub guard: [u8; 64],
+}
+
+/// Entry of the Fighter vtable's per-frame function (vtable slot
+/// `.text+0x4f80568`), run once per frame for every fighter before it
+/// updates: `sub sp, sp, #0xc0` then register saves. x0 = the Fighter.
+pub const FIGHTER_FRAME_OFFSET: usize = 0x614630;
+pub const FIGHTER_FRAME: Site = Site {
+    name: "fighter_frame",
+    offset: FIGHTER_FRAME_OFFSET,
+    guard: [
+        0xff, 0x03, 0x03, 0xd1, 0xea, 0x23, 0x00, 0xfd, 0xe9, 0x23, 0x05, 0x6d, 0xfc, 0x6f, 0x06,
+        0xa9, 0xfa, 0x67, 0x07, 0xa9, 0xf8, 0x5f, 0x08, 0xa9, 0xf6, 0x57, 0x09, 0xa9, 0xf4, 0x4f,
+        0x0a, 0xa9, 0xfd, 0x7b, 0x0b, 0xa9, 0xfd, 0xc3, 0x02, 0x91, 0x28, 0x65, 0x02, 0xb0, 0x19,
+        0x7d, 0x42, 0xf9, 0x28, 0x65, 0x02, 0x90, 0x08, 0xa9, 0x42, 0xf9, 0x09, 0x21, 0x40, 0x39,
+        0xf3, 0x03, 0x00, 0xaa,
+    ],
+};
+
+/// `app::BattleObject` fields: battle object id, fighter kind, entry, module accessor.
+pub const OBJECT_ID: usize = 0x8;
+pub const OBJECT_KIND: usize = 0xc;
+pub const OBJECT_ENTRY: usize = 0x10;
+pub const OBJECT_MODULE_ACCESSOR: usize = 0x20;
+
+pub const ENTRIES: usize = 8;
+pub const FIGHTER_KIND_GAMEWATCH: u32 = names::GAMEWATCH;
+pub const STATUS_SPECIAL_S: i32 = 0x1dd;
+pub const WORK_SPECIAL_S_KIND: i32 = 0x1000_00c2;
+pub const WORK_SPECIAL_S_PREV_KIND: i32 = 0x1000_00c1;
+pub const SITUATION_GROUND: i32 = 0;
+pub const SITUATION_CLIFF: i32 = 1;
+pub const SITUATION_AIR: i32 = 2;
+
+/// Where a fighter is.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Place {
+    #[default]
+    Unknown,
+    Ground,
+    Platform,
+    Air,
+    Ledge,
+}
+
+impl Place {
+    /// From `StatusModule::situation_kind` and `GroundModule::is_passable_ground`
+    /// (true while standing on a soft platform).
+    pub fn new(situation: i32, passable: bool) -> Self {
+        match situation {
+            SITUATION_GROUND if passable => Place::Platform,
+            SITUATION_GROUND => Place::Ground,
+            SITUATION_AIR => Place::Air,
+            SITUATION_CLIFF => Place::Ledge,
+            _ => Place::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Place::Unknown => "-",
+            Place::Ground => "ground",
+            Place::Platform => "platform",
+            Place::Air => "air",
+            Place::Ledge => "ledge",
+        }
+    }
+
+    fn code(self) -> u64 {
+        self as u64
+    }
+
+    fn from_code(code: u64) -> Self {
+        match code {
+            1 => Place::Ground,
+            2 => Place::Platform,
+            3 => Place::Air,
+            4 => Place::Ledge,
+            _ => Place::Unknown,
+        }
+    }
+}
+
+/// Collision masks for `AttackModule::is_infliction_status`.
+pub const COLLISION_KIND_MASK_ATTACK: u32 = 0x1;
+pub const COLLISION_KIND_MASK_HIT: u32 = 0x2;
+pub const COLLISION_KIND_MASK_SHIELD: u32 = 0x4;
+
+/// What the fighter's own hitboxes connected with during a status (from
+/// `AttackModule::is_infliction_status`; projectiles are separate objects and
+/// do not count). Ordered: a status that hit and was also shielded is `Hit`.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Contact {
+    #[default]
+    None,
+    /// Traded with another attack.
+    Clank,
+    Shield,
+    Hit,
+}
+
+impl Contact {
+    pub fn new(hit: bool, shield: bool, clank: bool) -> Self {
+        if hit {
+            Contact::Hit
+        } else if shield {
+            Contact::Shield
+        } else if clank {
+            Contact::Clank
+        } else {
+            Contact::None
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Contact::None => "none",
+            Contact::Clank => "clank",
+            Contact::Shield => "shield",
+            Contact::Hit => "hit",
+        }
+    }
+
+    fn code(self) -> u64 {
+        self as u64
+    }
+
+    fn from_code(code: u64) -> Self {
+        match code {
+            1 => Contact::Clank,
+            2 => Contact::Shield,
+            3 => Contact::Hit,
+            _ => Contact::None,
+        }
+    }
+}
+
+/// A status a fighter was in: its kind, the last motion seen in it, the
+/// fighter frame it started on and what its hitboxes connected with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Action {
+    pub status: i32,
+    pub motion: u64,
+    pub start: u32,
+    pub contact: Contact,
+}
+
+impl Action {
+    pub const NONE: Action = Action {
+        status: -1,
+        motion: 0,
+        start: 0,
+        contact: Contact::None,
+    };
+
+    /// A hash40 uses 40 bits; the contact goes above it.
+    fn words(self) -> [u64; 2] {
+        [
+            u64::from(self.status as u32) | u64::from(self.start) << 32,
+            self.motion & 0xff_ffff_ffff | self.contact.code() << 56,
+        ]
+    }
+
+    fn from_words(words: [u64; 2]) -> Self {
+        Action {
+            status: words[0] as u32 as i32,
+            motion: words[1] & 0xff_ffff_ffff,
+            start: (words[0] >> 32) as u32,
+            contact: Contact::from_code(words[1] >> 56),
+        }
+    }
+}
+
+/// Whether a status is a move (attack, special, grab, throw, final smash...).
+/// Fighter-specific statuses past the common range are nearly all parts of
+/// special moves, so they count as moves; for G&W the names decide.
+pub fn is_move(fighter: u32, status: i32) -> bool {
+    if status < 0 {
+        return false;
+    }
+    if status <= names::COMMON_STATUS_LAST {
+        return names::COMMON_STATUS[status as usize].1;
+    }
+    if fighter == FIGHTER_KIND_GAMEWATCH {
+        let index = (status - names::COMMON_STATUS_LAST - 1) as usize;
+        return names::GAMEWATCH_STATUS
+            .get(index)
+            .is_none_or(|entry| entry.1);
+    }
+    true
+}
+
+/// One fighter's frame counter, current, previous and last move status, and
+/// (for G&W) the Judge panel last seen. Owned by that fighter's own tick.
+#[derive(Clone, Copy, Debug)]
+pub struct History {
+    pub session: u32,
+    pub frame: u32,
+    pub cur: Action,
+    pub prev: Action,
+    /// The most recent move status before the current status.
+    pub last_move: Action,
+    started: bool,
+    panel: Option<i32>,
+    pub special_s: u32,
+    pub judges: u32,
+}
+
+impl History {
+    pub const fn new() -> Self {
+        Self {
+            session: 0,
+            frame: 0,
+            cur: Action::NONE,
+            prev: Action::NONE,
+            last_move: Action::NONE,
+            started: false,
+            panel: None,
+            special_s: 0,
+            judges: 0,
+        }
+    }
+
+    /// Forgets everything; the next frame is frame 0 of `session`.
+    pub fn begin(&mut self, session: u32) {
+        *self = Self::new();
+        self.session = session;
+    }
+
+    /// One frame of this fighter: its status, motion and what its hitboxes
+    /// have connected with in this status so far. Returns true when it
+    /// entered a new status.
+    pub fn observe(&mut self, fighter: u32, status: i32, motion: u64, contact: Contact) -> bool {
+        let frame = self.frame;
+        self.frame = self.frame.wrapping_add(1);
+        let action = Action {
+            status,
+            motion,
+            start: frame,
+            contact,
+        };
+        if !self.started {
+            self.started = true;
+            self.cur = action;
+            return false;
+        }
+        if status == self.cur.status {
+            self.cur.motion = motion;
+            self.cur.contact = self.cur.contact.max(contact);
+            return false;
+        }
+        if is_move(fighter, self.cur.status) {
+            self.last_move = self.cur;
+        }
+        self.prev = self.cur;
+        self.cur = action;
+        if fighter == FIGHTER_KIND_GAMEWATCH && status == STATUS_SPECIAL_S {
+            self.special_s += 1;
+        }
+        true
+    }
+
+    /// G&W's `SPECIAL_S_KIND` this frame; the Judge number 1..=9 when a panel
+    /// appeared since the last frame. The first value of a session only sets
+    /// the baseline.
+    pub fn panel(&mut self, kind: i32) -> Option<u8> {
+        let previous = self.panel.replace(kind)?;
+        if (0..=8).contains(&kind) && kind != previous {
+            self.judges += 1;
+            return Some(kind as u8 + 1);
+        }
+        None
+    }
+
+    /// Frames since `action` started, as of the current frame.
+    pub fn ago(&self, action: Action) -> u32 {
+        self.frame.wrapping_sub(1).wrapping_sub(action.start)
+    }
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A fighter as one frame saw it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Snapshot {
+    pub session: u32,
+    pub frame: u32,
+    pub entry: u8,
+    pub fighter: u32,
+    pub place: Place,
+    pub damage: f32,
+    pub x: f32,
+    pub y: f32,
+    pub cur: Action,
+    pub prev: Action,
+    pub last_move: Action,
+}
+
+pub const SNAPSHOT_WORDS: usize = 10;
+
+impl Snapshot {
+    pub fn to_words(&self) -> [u64; SNAPSHOT_WORDS] {
+        let [cur0, cur1] = self.cur.words();
+        let [prev0, prev1] = self.prev.words();
+        let [last0, last1] = self.last_move.words();
+        [
+            u64::from(self.session) | u64::from(self.frame) << 32,
+            u64::from(self.fighter) | u64::from(self.entry) << 32 | self.place.code() << 40,
+            u64::from(self.damage.to_bits()) | u64::from(self.x.to_bits()) << 32,
+            u64::from(self.y.to_bits()),
+            cur0,
+            cur1,
+            prev0,
+            prev1,
+            last0,
+            last1,
+        ]
+    }
+
+    pub fn from_words(w: &[u64; SNAPSHOT_WORDS]) -> Self {
+        Snapshot {
+            session: w[0] as u32,
+            frame: (w[0] >> 32) as u32,
+            fighter: w[1] as u32,
+            entry: (w[1] >> 32) as u8,
+            place: Place::from_code(w[1] >> 40 & 0xff),
+            damage: f32::from_bits(w[2] as u32),
+            x: f32::from_bits((w[2] >> 32) as u32),
+            y: f32::from_bits(w[3] as u32),
+            cur: Action::from_words([w[4], w[5]]),
+            prev: Action::from_words([w[6], w[7]]),
+            last_move: Action::from_words([w[8], w[9]]),
+        }
+    }
+
+    /// Frames since `action` started.
+    pub fn ago(&self, action: Action) -> u32 {
+        self.frame.wrapping_sub(action.start)
+    }
+}
+
+/// One Judge: the number, the number it could not be (the previous panel),
+/// what the Judge itself connected with, G&W and the opponent (the lowest
+/// other entry seen in the same session). Context is as of the frame the
+/// number appeared; `hit` is known once G&W leaves that side special.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Judge {
+    pub number: u8,
+    /// The previous panel's number, 0 when there was none.
+    pub prev_number: u8,
+    /// Fighters seen this session, G&W included.
+    pub players: u8,
+    /// `None` while unknown (the session ended during the Judge).
+    pub hit: Option<Contact>,
+    pub gw: Snapshot,
+    pub opp: Option<Snapshot>,
+}
+
+pub const JUDGE_WORDS: usize = 1 + 2 * SNAPSHOT_WORDS;
+const HIT_UNKNOWN: u64 = 0xff;
+
+impl Judge {
+    pub fn to_words(&self) -> [u64; JUDGE_WORDS] {
+        let mut words = [0; JUDGE_WORDS];
+        words[0] = u64::from(self.number)
+            | u64::from(self.prev_number) << 8
+            | u64::from(self.players) << 16
+            | u64::from(self.opp.is_some()) << 24
+            | self.hit.map_or(HIT_UNKNOWN, Contact::code) << 32;
+        words[1..=SNAPSHOT_WORDS].copy_from_slice(&self.gw.to_words());
+        if let Some(opp) = self.opp {
+            words[1 + SNAPSHOT_WORDS..].copy_from_slice(&opp.to_words());
+        }
+        words
+    }
+
+    pub fn from_words(words: &[u64; JUDGE_WORDS]) -> Self {
+        let snapshot = |at: usize| {
+            let mut w = [0; SNAPSHOT_WORDS];
+            w.copy_from_slice(&words[at..at + SNAPSHOT_WORDS]);
+            Snapshot::from_words(&w)
+        };
+        Judge {
+            number: words[0] as u8,
+            prev_number: (words[0] >> 8) as u8,
+            players: (words[0] >> 16) as u8,
+            hit: match words[0] >> 32 & 0xff {
+                HIT_UNKNOWN => None,
+                code => Some(Contact::from_code(code)),
+            },
+            gw: snapshot(1),
+            opp: (words[0] >> 24 & 1 != 0).then(|| snapshot(1 + SNAPSHOT_WORDS)),
+        }
+    }
+}
+
+/// A drawn Judge one frame later.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Outcome {
+    /// Still in the side special it was drawn in: its contact so far.
+    Running(Contact),
+    /// G&W left it: what the Judge connected with.
+    Done(Contact),
+}
+
+/// `drawn` = G&W's status when the number appeared, `so_far` = its contact as
+/// last seen.
+pub fn outcome(drawn: Action, so_far: Contact, history: &History) -> Outcome {
+    let same = |action: Action| action.start == drawn.start && action.status == drawn.status;
+    if same(history.cur) {
+        Outcome::Running(history.cur.contact)
+    } else if same(history.prev) {
+        Outcome::Done(history.prev.contact)
+    } else {
+        Outcome::Done(so_far)
+    }
+}
+
+/// The previous panel as a Judge number, 0 for none.
+pub fn prev_number(prev_kind: i32) -> u8 {
+    if (0..=8).contains(&prev_kind) {
+        prev_kind as u8 + 1
+    } else {
+        0
+    }
+}
+
+/// Columns of `judges.tsv`. `*_ago` = frames since that status started, at
+/// the frame the number appeared; `*_hit` = what that status's hitboxes
+/// connected with (`opp_status_hit`: so far). Statuses and motions are the
+/// game's names (hex when the name is not known).
+pub const HEADER: &str = "boot\tsession\tframe\tnumber\tnine\tprev_number\tjudge_hit\tplayers\t\
+gw_entry\tgw_place\tgw_damage\tgw_status\tgw_motion\tgw_status_ago\t\
+gw_prev\tgw_prev_motion\tgw_prev_ago\tgw_prev_hit\t\
+gw_last_move\tgw_last_move_motion\tgw_last_move_ago\tgw_last_move_hit\tgw_x\tgw_y\t\
+opp_entry\topp_fighter\topp_place\topp_damage\t\
+opp_status\topp_motion\topp_status_ago\topp_status_hit\t\
+opp_prev\topp_prev_motion\topp_prev_ago\topp_prev_hit\t\
+opp_last_move\topp_last_move_motion\topp_last_move_ago\topp_last_move_hit\t\
+opp_x\topp_y\tdistance";
+
+struct StatusName(u32, i32);
+
+impl fmt::Display for StatusName {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let (fighter, status) = (self.0, self.1);
+        if status < 0 {
+            return f.write_str("-");
+        }
+        let name = if status <= names::COMMON_STATUS_LAST {
+            names::COMMON_STATUS[status as usize].0
+        } else if fighter == FIGHTER_KIND_GAMEWATCH {
+            names::GAMEWATCH_STATUS
+                .get((status - names::COMMON_STATUS_LAST - 1) as usize)
+                .map_or("", |entry| entry.0)
+        } else {
+            ""
+        };
+        if name.is_empty() {
+            write!(f, "{status:#x}")
+        } else {
+            f.write_str(name)
+        }
+    }
+}
+
+struct MotionName(u64);
+
+impl fmt::Display for MotionName {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if self.0 == 0 {
+            return f.write_str("-");
+        }
+        match names::MOTION.binary_search_by_key(&self.0, |entry| entry.0) {
+            Ok(index) => f.write_str(names::MOTION[index].1),
+            Err(_) => write!(f, "{:#x}", self.0),
+        }
+    }
+}
+
+pub fn fighter_name(kind: u32) -> &'static str {
+    names::FIGHTER
+        .get(kind as usize)
+        .copied()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("?")
+}
+
+/// Status, motion and frames ago, then the contact when `with_hit`; dashes
+/// for a status the fighter has not had yet.
+fn write_action(
+    out: &mut impl fmt::Write,
+    snapshot: &Snapshot,
+    action: Action,
+    with_hit: bool,
+) -> fmt::Result {
+    write!(
+        out,
+        "\t{}\t{}",
+        StatusName(snapshot.fighter, action.status),
+        MotionName(action.motion)
+    )?;
+    if action.status < 0 {
+        out.write_str("\t-")?;
+        if with_hit {
+            out.write_str("\t-")?;
+        }
+        return Ok(());
+    }
+    write!(out, "\t{}", snapshot.ago(action))?;
+    if with_hit {
+        write!(out, "\t{}", action.contact.as_str())?;
+    }
+    Ok(())
+}
+
+/// One `judges.tsv` row (no newline).
+pub fn write_row(
+    out: &mut impl fmt::Write,
+    boot: &str,
+    session: u32,
+    judge: &Judge,
+) -> fmt::Result {
+    let gw = &judge.gw;
+    write!(
+        out,
+        "{boot}\t{session}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}",
+        gw.frame,
+        judge.number,
+        u8::from(judge.number == 9),
+        judge.prev_number,
+        judge.hit.map_or("-", Contact::as_str),
+        judge.players,
+        gw.entry,
+        gw.place.as_str(),
+        gw.damage,
+    )?;
+    write_action(out, gw, gw.cur, false)?;
+    write_action(out, gw, gw.prev, true)?;
+    write_action(out, gw, gw.last_move, true)?;
+    write!(out, "\t{:.1}\t{:.1}", gw.x, gw.y)?;
+    match &judge.opp {
+        Some(opp) => {
+            write!(
+                out,
+                "\t{}\t{}\t{}\t{:.1}",
+                opp.entry,
+                fighter_name(opp.fighter),
+                opp.place.as_str(),
+                opp.damage
+            )?;
+            write_action(out, opp, opp.cur, true)?;
+            write_action(out, opp, opp.prev, true)?;
+            write_action(out, opp, opp.last_move, true)?;
+            let distance = ((opp.x - gw.x).powi(2) + (opp.y - gw.y).powi(2)).sqrt();
+            write!(out, "\t{:.1}\t{:.1}\t{distance:.1}", opp.x, opp.y)
+        }
+        None => {
+            // entry, fighter, place, damage, 3 actions x 4, x, y, distance
+            for _ in 0..19 {
+                out.write_str("\t-")?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// A text line built in a fixed buffer; anything past `N` bytes is dropped.
+pub struct Line<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> Line<N> {
+    pub const fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// The text plus a NUL, for `nn::fs` paths; `None` when there is no room.
+    pub fn with_nul(&mut self) -> Option<&[u8]> {
+        if self.len >= N {
+            return None;
+        }
+        self.buf[self.len] = 0;
+        Some(&self.buf[..=self.len])
+    }
+}
+
+impl<const N: usize> Default for Line<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> fmt::Write for Line<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let take = s.len().min(N - self.len);
+        self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len += take;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::fmt::Write as _;
+
+    const WAIT: i32 = 0x0;
+    const DASH: i32 = 0x3;
+    const ATTACK_AIR: i32 = 0x36;
+    const LANDING_ATTACK_AIR: i32 = 0x18;
+    const GW: u32 = FIGHTER_KIND_GAMEWATCH;
+    const MARIO: u32 = 0;
+
+    fn hash40(name: &str) -> u64 {
+        // CRC-32 (IEEE) | length << 32, as the game hashes motion names.
+        let mut crc = 0xffff_ffffu32;
+        for byte in name.bytes() {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    crc >> 1 ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        u64::from(!crc) | (name.len() as u64) << 32
+    }
+
+    #[test]
+    fn the_guard_starts_with_the_hooked_instruction() {
+        // sub sp, sp, #0xc0
+        assert_eq!(FIGHTER_FRAME.guard[..4], [0xff, 0x03, 0x03, 0xd1]);
+    }
+
+    #[test]
+    fn names_resolve() {
+        assert_eq!(fighter_name(GW), "gamewatch");
+        assert_eq!(fighter_name(MARIO), "mario");
+        assert_eq!(StatusName(GW, STATUS_SPECIAL_S).to_string(), "special_s");
+        assert_eq!(StatusName(MARIO, ATTACK_AIR).to_string(), "attack_air");
+        assert_eq!(StatusName(MARIO, 0x1f0).to_string(), "0x1f0");
+        assert_eq!(StatusName(GW, -1).to_string(), "-");
+        assert_eq!(
+            MotionName(hash40("attack_air_f")).to_string(),
+            "attack_air_f"
+        );
+        assert_eq!(
+            MotionName(hash40("special_air_s")).to_string(),
+            "special_air_s"
+        );
+        assert_eq!(MotionName(0x12_3456_789a).to_string(), "0x123456789a");
+        assert!(names::MOTION.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    #[test]
+    fn moves_are_classified() {
+        assert!(is_move(MARIO, ATTACK_AIR));
+        assert!(is_move(MARIO, STATUS_SPECIAL_S));
+        assert!(!is_move(MARIO, WAIT));
+        assert!(!is_move(MARIO, LANDING_ATTACK_AIR));
+        assert!(is_move(MARIO, 0x1f0));
+        assert!(!is_move(MARIO, -1));
+    }
+
+    #[test]
+    fn places() {
+        assert_eq!(Place::new(SITUATION_GROUND, false), Place::Ground);
+        assert_eq!(Place::new(SITUATION_GROUND, true), Place::Platform);
+        assert_eq!(Place::new(SITUATION_AIR, true), Place::Air);
+        assert_eq!(Place::new(SITUATION_CLIFF, false), Place::Ledge);
+        assert_eq!(Place::new(-1, false), Place::Unknown);
+    }
+
+    const NONE: Contact = Contact::None;
+
+    #[test]
+    fn history_keeps_previous_status_and_last_move() {
+        let mut h = History::new();
+        h.begin(3);
+        let nair = hash40("attack_air_n");
+        h.observe(GW, WAIT, hash40("wait1"), NONE); // frame 0
+        h.observe(GW, ATTACK_AIR, nair, NONE); // 1
+        for frame in 2..=20 {
+            let contact = if frame < 8 { NONE } else { Contact::Hit };
+            h.observe(GW, ATTACK_AIR, nair, contact);
+        }
+        h.observe(GW, LANDING_ATTACK_AIR, hash40("landing_air_n"), NONE); // 21
+        h.observe(GW, WAIT, hash40("wait1"), NONE); // 22
+        assert!(h.observe(GW, STATUS_SPECIAL_S, hash40("special_s"), NONE)); // 23
+        assert_eq!(h.special_s, 1);
+        assert_eq!(h.cur.status, STATUS_SPECIAL_S);
+        assert_eq!(h.prev.status, WAIT);
+        assert_eq!(h.prev.contact, NONE);
+        assert_eq!(h.last_move.status, ATTACK_AIR);
+        assert_eq!(h.last_move.motion, nair);
+        assert_eq!(h.last_move.contact, Contact::Hit);
+        assert_eq!(h.ago(h.last_move), 22);
+        assert_eq!(h.ago(h.prev), 1);
+        assert_eq!(h.ago(h.cur), 0);
+    }
+
+    #[test]
+    fn motion_and_contact_follow_the_status() {
+        let mut h = History::new();
+        h.observe(MARIO, 0x27, hash40("attack_11"), NONE);
+        h.observe(MARIO, 0x27, hash40("attack_12"), Contact::Shield);
+        h.observe(MARIO, 0x27, hash40("attack_12"), Contact::Hit);
+        h.observe(MARIO, 0x27, hash40("attack_12"), Contact::Clank);
+        h.observe(MARIO, WAIT, hash40("wait1"), NONE);
+        assert_eq!(h.prev.motion, hash40("attack_12"));
+        assert_eq!(h.prev.contact, Contact::Hit);
+        assert_eq!(h.last_move.status, 0x27);
+        assert_eq!(Contact::new(false, true, true), Contact::Shield);
+        assert_eq!(Contact::new(true, true, false), Contact::Hit);
+        assert_eq!(Contact::new(false, false, false), NONE);
+    }
+
+    #[test]
+    fn a_panel_is_reported_once_per_draw() {
+        let mut h = History::new();
+        assert_eq!(h.panel(-1), None); // baseline
+        assert_eq!(h.panel(-1), None);
+        assert_eq!(h.panel(8), Some(9));
+        assert_eq!(h.panel(8), None);
+        assert_eq!(h.panel(-1), None); // init_panel
+        assert_eq!(h.panel(2), Some(3));
+        assert_eq!(h.panel(5), Some(6)); // a new draw without a reset
+        assert_eq!(h.judges, 3);
+        let mut late = History::new();
+        assert_eq!(late.panel(4), None); // already showing when first seen
+        assert_eq!(prev_number(8), 9);
+        assert_eq!(prev_number(-1), 0);
+    }
+
+    #[test]
+    fn the_judge_outcome_is_known_when_the_side_special_ends() {
+        let mut h = History::new();
+        h.observe(GW, WAIT, hash40("wait1"), NONE);
+        h.observe(GW, STATUS_SPECIAL_S, hash40("special_s"), NONE);
+        let drawn = h.cur;
+        h.observe(GW, STATUS_SPECIAL_S, hash40("special_s"), NONE);
+        assert_eq!(outcome(drawn, NONE, &h), Outcome::Running(NONE));
+        h.observe(GW, STATUS_SPECIAL_S, hash40("special_s"), Contact::Hit);
+        assert_eq!(outcome(drawn, NONE, &h), Outcome::Running(Contact::Hit));
+        h.observe(GW, WAIT, hash40("wait1"), NONE);
+        assert_eq!(
+            outcome(drawn, Contact::Hit, &h),
+            Outcome::Done(Contact::Hit)
+        );
+        h.observe(GW, 0x0b, hash40("jump_f"), NONE);
+        assert_eq!(
+            outcome(drawn, Contact::Shield, &h),
+            Outcome::Done(Contact::Shield)
+        );
+    }
+
+    fn sample() -> Judge {
+        let action = |status: i32, motion: &str, start: u32, contact: Contact| Action {
+            status,
+            motion: hash40(motion),
+            start,
+            contact,
+        };
+        Judge {
+            number: 9,
+            prev_number: 4,
+            players: 2,
+            hit: Some(Contact::Hit),
+            gw: Snapshot {
+                session: 2,
+                frame: 600,
+                entry: 0,
+                fighter: GW,
+                place: Place::Platform,
+                damage: 37.5,
+                x: -10.0,
+                y: 35.25,
+                cur: action(STATUS_SPECIAL_S, "special_s", 598, NONE),
+                prev: action(DASH, "dash", 590, NONE),
+                last_move: action(ATTACK_AIR, "attack_air_f", 540, Contact::Shield),
+            },
+            opp: Some(Snapshot {
+                session: 2,
+                frame: 600,
+                entry: 1,
+                fighter: MARIO,
+                place: Place::Air,
+                damage: 82.0,
+                x: 20.0,
+                y: 75.25,
+                cur: action(ATTACK_AIR, "attack_air_b", 595, NONE),
+                prev: action(0x0c, "jump_aerial_f", 585, NONE),
+                last_move: action(0x27, "attack_13", 500, Contact::Hit),
+            }),
+        }
+    }
+
+    #[test]
+    fn records_round_trip() {
+        let judge = sample();
+        assert_eq!(Judge::from_words(&judge.to_words()), judge);
+        let alone = Judge {
+            opp: None,
+            hit: None,
+            ..judge
+        };
+        assert_eq!(Judge::from_words(&alone.to_words()), alone);
+        let none = Action::NONE;
+        assert_eq!(Action::from_words(none.words()), none);
+    }
+
+    #[test]
+    fn a_row_has_one_value_per_column() {
+        let judge = sample();
+        let mut line = Line::<1024>::new();
+        write_row(&mut line, "20261029-201500", 2, &judge).unwrap();
+        let row = core::str::from_utf8(line.as_bytes()).unwrap();
+        let columns = HEADER.split('\t').count();
+        assert_eq!(row.split('\t').count(), columns, "{row}");
+        assert_eq!(
+            row,
+            "20261029-201500\t2\t600\t9\t1\t4\thit\t2\t0\tplatform\t37.5\
+             \tspecial_s\tspecial_s\t2\tdash\tdash\t10\tnone\
+             \tattack_air\tattack_air_f\t60\tshield\t-10.0\t35.2\
+             \t1\tmario\tair\t82.0\tattack_air\tattack_air_b\t5\tnone\
+             \tjump_aerial\tjump_aerial_f\t15\tnone\tattack\tattack_13\t100\thit\
+             \t20.0\t75.2\t50.0"
+        );
+        line.clear();
+        let alone = Judge {
+            opp: None,
+            hit: None,
+            ..judge
+        };
+        write_row(&mut line, "b", 1, &alone).unwrap();
+        let row = core::str::from_utf8(line.as_bytes()).unwrap();
+        assert_eq!(row.split('\t').count(), columns, "{row}");
+        assert!(row.starts_with("b\t1\t600\t9\t1\t4\t-\t2\t"), "{row}");
+    }
+
+    #[test]
+    fn lines_are_fixed() {
+        let mut short = Line::<8>::new();
+        write!(short, "0123456789").unwrap();
+        assert_eq!(short.as_bytes(), b"01234567");
+        assert_eq!(short.with_nul(), None);
+    }
+}
