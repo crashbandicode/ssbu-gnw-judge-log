@@ -7,7 +7,8 @@
 Skyline plugin for Super Smash Bros. Ultimate 13.0.5 that logs every Game &
 Watch Judge: the number, what both players were doing, where they were, their
 damage and whether their moves hit. After enough matches the log is a dataset
-for asking when 9s come up. Read-only: safe to leave on online.
+for asking when 9s come up. Only 1v1 matches with G&W are logged; without G&W
+the plugin does nothing. Read-only: safe to leave on online.
 
 ![Judge](docs/media/judge.gif)
 
@@ -32,7 +33,9 @@ opp: ridley  ground  0.0%  landing_fall_special  distance=21.4
 python3 tools/judge_table.py judges.tsv -o judges.csv
 ```
 
-It prints how often each number came up and, per context (place, previous
+It keeps tournament-legal stages (the list is at the top of the script;
+`--all-stages` keeps everything) and prints how often each number came up
+and, per context (place, previous
 move, hit or not, damage...), the 9s seen against what a fair draw gives. The
 game never repeats the number it holds as the previous one (it forgets it when
 G&W is KO'd), so a fair draw gives a 9 one time in 8.

@@ -11,7 +11,10 @@ boot; on any mismatch nothing is installed and `plugin.log` says why.
 
 ## What the hook reads, per fighter and frame
 
-Only the fighter whose frame it is, through the game's own getters:
+It reads the fighter's kind first. Until a Game & Watch has played a frame in
+the current match, every other fighter returns right there: a match without
+G&W costs a few memory reads per fighter and frame, and writes nothing. With
+G&W it reads only the fighter whose frame it is, through the game's own getters:
 status and situation (`StatusModule`), animation (`MotionModule`), soft
 platform (`GroundModule::is_passable_ground`), damage, position, and
 `AttackModule::is_infliction_status` (hit, shield, clank). For G&W also the

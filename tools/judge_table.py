@@ -21,7 +21,16 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+# Tournament-legal stages as the plugin names them (edit to match your ruleset):
+# Battlefield, Small Battlefield, Final Destination, Pokemon Stadium 2,
+# Smashville, Town and City, Kalos, Hollow Bastion, Yoshi's Story, Lylat Cruise.
+LEGAL_STAGES = {
+    'battlefield', 'battlefield_s', 'end', 'poke_stadium2', 'animal_village',
+    'animal_city', 'poke_kalos', 'trail_castle', 'yoshi_story', 'fox_lylatcruise',
+}
+
 CONTEXTS = [
+    'stage',
     'gw_place', 'opp_place',
     'gw_prev', 'gw_prev_hit', 'gw_last_move', 'gw_last_move_motion', 'gw_last_move_hit',
     'opp_fighter', 'opp_status', 'opp_status_hit', 'opp_prev', 'opp_prev_hit',
@@ -180,8 +189,15 @@ def main(argv=None):
     parser.add_argument('-o', '--output', help='CSV to write (default: judges.csv here)',
                         default='judges.csv')
     parser.add_argument('--min', type=int, default=10, help='smallest group to report')
+    parser.add_argument('--all-stages', action='store_true',
+                        help='keep Judges on stages outside LEGAL_STAGES')
     args = parser.parse_args(argv)
     files, rows = read_rows(args.inputs)
+    if not args.all_stages:
+        kept = [row for row in rows if row.get('stage') in LEGAL_STAGES]
+        if len(kept) < len(rows):
+            print(f'{len(rows) - len(kept)} Judge(s) on other stages left out (--all-stages keeps them)')
+        rows = kept
     if not files:
         parser.error('no judges.tsv found')
     derive(rows)

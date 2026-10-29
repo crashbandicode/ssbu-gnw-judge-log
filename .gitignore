@@ -7,3 +7,6 @@ target/
 *.log
 *.dmp
 __pycache__/
+# collected logs and generated tables
+data/
+judges.csv

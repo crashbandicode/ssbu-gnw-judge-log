@@ -392,8 +392,8 @@ impl Snapshot {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Judge {
     pub drawn: Drawn,
-    /// Fighters seen this session, G&W included.
-    pub players: u8,
+    /// `app::stage::get_stage_id` when the number appeared.
+    pub stage: u16,
     /// `None` while unknown (the session ended during the Judge).
     pub hit: Option<Contact>,
     pub gw: Snapshot,
@@ -408,10 +408,10 @@ impl Judge {
         let mut words = [0; JUDGE_WORDS];
         words[0] = u64::from(self.drawn.number)
             | u64::from(self.drawn.excluded) << 8
-            | u64::from(self.players) << 16
             | u64::from(self.opp.is_some()) << 24
             | self.hit.map_or(HIT_UNKNOWN, Contact::code) << 32
-            | u64::from(self.drawn.last_number) << 40;
+            | u64::from(self.drawn.last_number) << 40
+            | u64::from(self.stage) << 48;
         words[1..=SNAPSHOT_WORDS].copy_from_slice(&self.gw.to_words());
         if let Some(opp) = self.opp {
             words[1 + SNAPSHOT_WORDS..].copy_from_slice(&opp.to_words());
@@ -431,7 +431,7 @@ impl Judge {
                 excluded: (words[0] >> 8) as u8,
                 last_number: (words[0] >> 40) as u8,
             },
-            players: (words[0] >> 16) as u8,
+            stage: (words[0] >> 48) as u16,
             hit: match words[0] >> 32 & 0xff {
                 HIT_UNKNOWN => None,
                 code => Some(Contact::from_code(code)),
@@ -478,7 +478,7 @@ pub fn panel_number(prev_kind: i32) -> u8 {
 /// connected with (`opp_status_hit`: so far). Statuses and motions are the
 /// game's names (hex when the name is not known).
 pub const HEADER: &str = "boot\tsession\tframe\tnumber\tnine\texcluded\tlast_number\t\
-judge_hit\tplayers\t\
+judge_hit\tstage\t\
 gw_entry\tgw_place\tgw_damage\tgw_status\tgw_motion\tgw_status_ago\t\
 gw_prev\tgw_prev_motion\tgw_prev_ago\tgw_prev_hit\t\
 gw_last_move\tgw_last_move_motion\tgw_last_move_ago\tgw_last_move_hit\tgw_x\tgw_y\t\
@@ -523,6 +523,20 @@ impl fmt::Display for MotionName {
         match names::MOTION.binary_search_by_key(&self.0, |entry| entry.0) {
             Ok(index) => f.write_str(names::MOTION[index].1),
             Err(_) => write!(f, "{:#x}", self.0),
+        }
+    }
+}
+
+struct StageName(u16);
+
+impl fmt::Display for StageName {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match names::STAGE
+            .get(usize::from(self.0))
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => f.write_str(name),
+            None => write!(f, "{:#x}", self.0),
         }
     }
 }
@@ -580,7 +594,7 @@ pub fn write_row(
         judge.drawn.excluded,
         judge.drawn.last_number,
         judge.hit.map_or("-", Contact::as_str),
-        judge.players,
+        StageName(judge.stage),
         gw.entry,
         gw.place.as_str(),
         gw.damage,
@@ -700,6 +714,9 @@ mod tests {
     fn names_resolve() {
         assert_eq!(fighter_name(GW), "gamewatch");
         assert_eq!(fighter_name(MARIO), "mario");
+        assert_eq!(StageName(0x101).to_string(), "animal_city");
+        assert_eq!(StageName(0x15b).to_string(), "battlefield_s");
+        assert_eq!(StageName(0xffff).to_string(), "0xffff");
         assert_eq!(StatusName(GW, STATUS_SPECIAL_S).to_string(), "special_s");
         assert_eq!(StatusName(MARIO, ATTACK_AIR).to_string(), "attack_air");
         assert_eq!(StatusName(MARIO, 0x1f0).to_string(), "0x1f0");
@@ -839,7 +856,7 @@ mod tests {
                 excluded: 4,
                 last_number: 4,
             },
-            players: 2,
+            stage: 0x15b,
             hit: Some(Contact::Hit),
             gw: Snapshot {
                 session: 2,
@@ -894,7 +911,7 @@ mod tests {
         assert_eq!(row.split('\t').count(), columns, "{row}");
         assert_eq!(
             row,
-            "20261029-201500\t2\t600\t9\t1\t4\t4\thit\t2\t0\tplatform\t37.5\
+            "20261029-201500\t2\t600\t9\t1\t4\t4\thit\tbattlefield_s\t0\tplatform\t37.5\
              \tspecial_s\tspecial_s\t2\tdash\tdash\t10\tnone\
              \tattack_air\tattack_air_f\t60\tshield\t-10.0\t35.2\
              \t1\tmario\tair\t82.0\tattack_air\tattack_air_b\t5\tnone\
@@ -910,7 +927,10 @@ mod tests {
         write_row(&mut line, "b", 1, &alone).unwrap();
         let row = core::str::from_utf8(line.as_bytes()).unwrap();
         assert_eq!(row.split('\t').count(), columns, "{row}");
-        assert!(row.starts_with("b\t1\t600\t9\t1\t4\t4\t-\t2\t"), "{row}");
+        assert!(
+            row.starts_with("b\t1\t600\t9\t1\t4\t4\t-\tbattlefield_s\t"),
+            "{row}"
+        );
     }
 
     #[test]

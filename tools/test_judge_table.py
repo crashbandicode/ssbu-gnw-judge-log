@@ -1,4 +1,5 @@
 """Tests for judge_table.py: python3 -I -m unittest discover -s tools"""
+import contextlib
 import io
 import random
 import sys
@@ -88,6 +89,21 @@ class JudgeTableTest(unittest.TestCase):
         judge_table.summary(rows, 10, out)
         line = next(l for l in out.getvalue().splitlines() if l.startswith('9s:'))
         self.assertIn('p = 0.000', line)
+
+    def test_only_legal_stages_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            rows = fair_rows(40, 3)
+            for i, row in enumerate(rows):
+                row['stage'] = 'battlefield' if i % 4 else 'mariobros'
+            write_tsv(tmp / 'judges.tsv', rows)
+            out = tmp / 'out.csv'
+            with contextlib.redirect_stdout(io.StringIO()):
+                judge_table.main([str(tmp / 'judges.tsv'), '-o', str(out)])
+            self.assertEqual(len(out.read_text().splitlines()), 1 + 30)
+            with contextlib.redirect_stdout(io.StringIO()):
+                judge_table.main([str(tmp / 'judges.tsv'), '-o', str(out), '--all-stages'])
+            self.assertEqual(len(out.read_text().splitlines()), 1 + 40)
 
     def test_header_matches_the_plugin(self):
         columns = header_columns()

@@ -78,6 +78,8 @@ extern "C" {
     fn is_infliction_status(accessor: u64, mask: u32) -> bool;
     #[link_name = "\u{1}_ZN3app7fighter20get_id_from_entry_idEi"]
     fn id_from_entry(entry: i32) -> u32;
+    #[link_name = "\u{1}_ZN3app5stage12get_stage_idEv"]
+    fn stage_id() -> i32;
 }
 
 /// State touched by one thread only (each entry's history by that fighter's
@@ -172,6 +174,8 @@ static NOTE_HEAD: AtomicU64 = AtomicU64::new(0);
 static LAST_FRAME_TICK: AtomicU64 = AtomicU64::new(0);
 static SESSION: AtomicU32 = AtomicU32::new(0);
 static FIRST_SEEN: AtomicU32 = AtomicU32::new(0);
+/// The last session a Game & Watch played in.
+static GW_SESSION: AtomicU32 = AtomicU32::new(0);
 
 /// The writer thread's object and stack, static so no heap is involved.
 #[repr(C, align(4096))]
@@ -339,12 +343,19 @@ unsafe fn gnw_judge_fighter_frame(ctx: &InlineCtx) {
     if entry >= ENTRIES || accessor < 0x10000 {
         return;
     }
+    let kind = read_u32(fighter + OBJECT_KIND as u64);
+    let session = session_at(tick());
+    // Inactive unless a Game & Watch plays: everyone else stops here.
+    if kind == FIGHTER_KIND_GAMEWATCH {
+        GW_SESSION.store(session, Ordering::Release);
+    } else if GW_SESSION.load(Ordering::Acquire) != session {
+        return;
+    }
     // Ice Climbers' partner and Pokémon Trainer's resting Pokémon share their
     // entry: follow only the entry's active fighter.
     if read_u32(fighter + OBJECT_ID as u64) != id_from_entry(entry as i32) {
         return;
     }
-    let kind = read_u32(fighter + OBJECT_KIND as u64);
     if FIRST_SEEN.swap(1, Ordering::AcqRel) == 0 {
         push_note(
             NOTE_FIRST,
@@ -352,7 +363,6 @@ unsafe fn gnw_judge_fighter_frame(ctx: &InlineCtx) {
             accessor.wrapping_sub(fighter),
         );
     }
-    let session = session_at(tick());
     // SAFETY: only this entry's own frame touches its history.
     let history = &mut *HISTORY[entry].0.get();
     if history.session != session {
@@ -407,12 +417,16 @@ unsafe fn gnw_judge_fighter_frame(ctx: &InlineCtx) {
             opp = opp.or(Some(seen));
         }
     }
+    // Only 1v1 matches are logged.
+    if players != 2 {
+        return;
+    }
     hold(
         entry,
         session,
         &Judge {
             drawn,
-            players,
+            stage: stage_id() as u16,
             hit: None,
             gw: snapshot,
             opp,
@@ -693,6 +707,12 @@ impl Writer {
         }
         self.reported = session;
         self.flush_pending();
+        let players = (0..ENTRIES)
+            .filter(|entry| snapshot_of(*entry).is_some_and(|seen| seen.session == session))
+            .count();
+        if players != 2 {
+            return;
+        }
         let mut line = Line::<192>::new();
         for (entry, counts) in COUNTS.iter().enumerate() {
             if counts.session.load(Ordering::Acquire) != session {

@@ -1,9 +1,10 @@
 # judges.tsv
 
-One row per Judge (Game & Watch's side special), tab-separated, header in the
-first line. Rows are appended when G&W leaves the side special, so the Judge's
-own result is known. The context columns describe the frame the number
-appeared on. Every G&W in the match is logged, CPUs included.
+One row per Judge (Game & Watch's side special) in 1v1 matches, tab-separated,
+header in the first line. Rows are appended when G&W leaves the side special,
+so the Judge's own result is known. The context columns describe the frame the
+number appeared on. Both players are logged if both are G&W, CPUs included.
+Matches without G&W, or with more than two fighters, leave no trace.
 
 | Column | Meaning |
 |---|---|
@@ -14,7 +15,7 @@ appeared on. Every G&W in the match is logged, CPUs included.
 | `excluded` | the number the game held as the previous Judge, which cannot come up; 0 when it held none (first Judge of a match, first after G&W is KO'd) |
 | `last_number` | the previous Judge in this session, 0 for the first |
 | `judge_hit` | what the Judge hit: `hit`, `shield`, `clank`, `none`, `-` if the match ended mid-Judge |
-| `players` | fighters in the match |
+| `stage` | the game's stage id name: `battlefield`, `battlefield_s`, `end` (Final Destination), `animal_village` (Smashville), `animal_city` (Town and City), `poke_stadium2`, `poke_kalos`, `trail_castle` (Hollow Bastion)...; `battle_*` / `end_*` are Battlefield and Omega forms |
 | `gw_entry` | G&W's player slot (0 = P1) |
 | `gw_place`, `opp_place` | `ground`, `platform`, `air`, `ledge` |
 | `gw_damage`, `opp_damage` | percent |
@@ -47,4 +48,5 @@ Merges files (dropping duplicates), adds `match_id`, `judge_index`,
 `frames_since_last_judge`, `damage_diff`, `repeat`, binned damage and
 distance, and `p_nine` (a fair draw's chance of a 9 for that row: 1/8, 0 when
 9 is excluded, 1/9 when nothing is), then prints the 9 rate per context
-against that expectation.
+against that expectation. Only tournament-legal stages are kept unless
+`--all-stages` is given; the list is `LEGAL_STAGES` at the top of the script.

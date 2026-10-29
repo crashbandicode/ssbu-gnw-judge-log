@@ -67,6 +67,19 @@ def consts(text, prefix):
         yield name.lower(), int(value, 16)
 
 
+def stages(text):
+    """The StageID block of lua_const.rs (the one holding `BattleField: 0x0`)."""
+    lines = text.splitlines()
+    at = next(i for i, line in enumerate(lines) if re.match(r'\s*BattleField: 0x0,', line))
+    start = max(i for i in range(at) if 'lua_consts!(' in lines[i])
+    end = next(i for i in range(at, len(lines)) if lines[i].strip() == ');')
+    for line in lines[start:end]:
+        m = re.match(r'\s*([A-Za-z0-9_]+): 0x([0-9A-F]+),', line)
+        # Skip MAX and the 0xFFFFFFFF Invalid sentinel.
+        if m and m.group(1) not in ('MAX', 'Invalid') and int(m.group(2), 16) < 0x1000:
+            yield m.group(1).lower(), int(m.group(2), 16)
+
+
 def is_move(name):
     for head in ('attack', 'special', 'catch', 'throw', 'final', 'cliff_attack',
                  'down_stand_attack', 'slip_stand_attack', 'item_throw', 'item_swing',
@@ -77,6 +90,7 @@ def is_move(name):
 
 
 def table(entries, first, last):
+    assert last - first < 0x1000, f'table range {first:#x}..{last:#x} too large'
     by_value = {}
     for name, value in entries:
         if first <= value <= last:
@@ -115,6 +129,14 @@ def main():
     print('/// Fighter kinds by value.')
     print(f'pub static FIGHTER: [&str; {len(fighters)}] = [')
     for name in fighters:
+        print(f'    "{name or ""}",')
+    print('];')
+    print()
+    stage_names = table(stages(text), 0, max(v for _, v in stages(text)))
+    print('/// Stage ids (`app::stage::get_stage_id`) by value; `end_*` = Omega form,')
+    print('/// `battle_*` = Battlefield form.')
+    print(f'pub static STAGE: [&str; {len(stage_names)}] = [')
+    for name in stage_names:
         print(f'    "{name or ""}",')
     print('];')
     print()
