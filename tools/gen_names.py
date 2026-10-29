@@ -107,8 +107,13 @@ def emit_status(var, names):
 
 def main():
     text = open(sys.argv[1], encoding='utf-8').read()
-    common = table(consts(text, 'FIGHTER_STATUS_KIND_'), 0, COMMON_LAST)
-    gamewatch = table(consts(text, 'FIGHTER_GAMEWATCH_STATUS_KIND_'), COMMON_LAST + 1, 0x204)
+    # Range markers share values with real statuses (COMMON_NUM = SPECIAL_N,
+    # EXTERN_HEAD = LOSE); keep the statuses.
+    status_marker = re.compile(r'^(common_num|extern_head|num|prev|term)$')
+    common = table(((n, v) for n, v in consts(text, 'FIGHTER_STATUS_KIND_')
+                    if not status_marker.match(n)), 0, COMMON_LAST)
+    gamewatch = table(((n, v) for n, v in consts(text, 'FIGHTER_GAMEWATCH_STATUS_KIND_')
+                       if not status_marker.match(n)), COMMON_LAST + 1, 0x204)
     # Range markers (BASE_HEAD, OTHER_NUM, ...) share values with real fighters.
     markers = re.compile(r'^(base|other|base_append)_(head|tail|num)$|^(all|none|term)$')
     fighters = table(((n, v) for n, v in consts(text, 'FIGHTER_KIND_') if not markers.match(n)),

@@ -40,3 +40,16 @@ streams has been drawn (see `ssbu-desync-detector/docs/WHAT-IS-CHECKED.md`).
 The hook calls no RNG, skips nothing and writes no game memory: getters and
 reads only. Files are written by the plugin's own thread. No heap allocations
 (`heap_allocations=0` in `plugin.log`).
+
+Replay A/B in Eden (2026-10-29), as in that document: the same replay played
+with only the desync detector, then with the detector and this plugin.
+
+| Replay | Build | Frames | Result |
+|---|---|---|---|
+| Pikachu vs Wolf | reads every fighter (before the G&W gate) | 12,640 + 2,355 | identical check values and positions |
+| G&W vs Captain Falcon, Umbra Clock Tower | gated | 15,374 | identical |
+| Pikachu vs Wolf | gated (no G&W: only the install line in `plugin.log`) | 12,640 | identical |
+
+Live Eden matches against CPUs logged every side special (`special_s` =
+`judges` in `plugin.log`), and every logged number matched G&W's
+`special_s_N` animation and the panels in the recordings.

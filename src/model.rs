@@ -737,6 +737,9 @@ mod tests {
     fn moves_are_classified() {
         assert!(is_move(MARIO, ATTACK_AIR));
         assert!(is_move(MARIO, STATUS_SPECIAL_S));
+        // 0x1dc is also COMMON_NUM in lua_const; it must read as special_n.
+        assert!(is_move(MARIO, 0x1dc));
+        assert_eq!(StatusName(MARIO, 0x1dc).to_string(), "special_n");
         assert!(!is_move(MARIO, WAIT));
         assert!(!is_move(MARIO, LANDING_ATTACK_AIR));
         assert!(is_move(MARIO, 0x1f0));
