@@ -32,7 +32,8 @@ def fair_rows(count, seed):
     for i in range(count):
         number = rng.choice([k for k in range(1, 10) if k != prev])
         rows.append({'boot': 'b', 'session': 1 + i // 20, 'frame': 100 * i, 'number': number,
-                     'nine': int(number == 9), 'prev_number': prev, 'gw_entry': 0,
+                     'nine': int(number == 9), 'excluded': prev, 'last_number': prev,
+                     'gw_entry': 0,
                      'gw_place': rng.choice(['ground', 'air', 'platform']),
                      'gw_damage': rng.randrange(0, 150), 'opp_damage': rng.randrange(0, 150),
                      'distance': rng.randrange(0, 120)})
@@ -77,7 +78,7 @@ class JudgeTableTest(unittest.TestCase):
     def test_a_biased_draw_is_flagged(self):
         rows = fair_rows(2000, 11)
         for row in rows[::3]:
-            if row['prev_number'] != 9:
+            if row['excluded'] != 9:
                 row['number'], row['nine'] = 9, 1
         for row in rows:
             for key, value in list(row.items()):

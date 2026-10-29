@@ -7,11 +7,10 @@
 //! allocates: the counting allocator below reports the plugin's heap
 //! allocations (expected 0) in `plugin.log`.
 use crate::model::{
-    self, outcome, prev_number, write_row, Contact, History, Judge, Line, Outcome, Place, Site,
-    Snapshot, COLLISION_KIND_MASK_ATTACK, COLLISION_KIND_MASK_HIT, COLLISION_KIND_MASK_SHIELD,
-    ENTRIES, FIGHTER_FRAME, FIGHTER_KIND_GAMEWATCH, JUDGE_WORDS, OBJECT_ENTRY, OBJECT_ID,
-    OBJECT_KIND, OBJECT_MODULE_ACCESSOR, SNAPSHOT_WORDS, WORK_SPECIAL_S_KIND,
-    WORK_SPECIAL_S_PREV_KIND,
+    self, outcome, write_row, Contact, History, Judge, Line, Outcome, Place, Site, Snapshot,
+    COLLISION_KIND_MASK_ATTACK, COLLISION_KIND_MASK_HIT, COLLISION_KIND_MASK_SHIELD, ENTRIES,
+    FIGHTER_FRAME, FIGHTER_KIND_GAMEWATCH, JUDGE_WORDS, OBJECT_ENTRY, OBJECT_ID, OBJECT_KIND,
+    OBJECT_MODULE_ACCESSOR, SNAPSHOT_WORDS, WORK_SPECIAL_S_KIND, WORK_SPECIAL_S_PREV_KIND,
 };
 use core::cell::UnsafeCell;
 use core::fmt::Write as _;
@@ -383,21 +382,21 @@ unsafe fn gnw_judge_fighter_frame(ctx: &InlineCtx) {
         return;
     }
     follow_pending(entry, session, history);
-    let panel = work_int(accessor, WORK_SPECIAL_S_KIND);
+    let panel = work_int(accessor, WORK_SPECIAL_S_PREV_KIND);
     if history.frame == 1 {
-        let prev = work_int(accessor, WORK_SPECIAL_S_PREV_KIND);
+        let kind = work_int(accessor, WORK_SPECIAL_S_KIND);
         push_note(
             NOTE_GW,
             u64::from(session) | (entry as u64) << 32,
-            u64::from(panel as u32) | u64::from(prev as u32) << 32,
+            u64::from(kind as u32) | u64::from(panel as u32) << 32,
         );
     }
-    let number = history.panel(panel);
+    let drawn = history.panel(panel);
     let counts = &COUNTS[entry];
     counts.special_s.store(history.special_s, Ordering::Relaxed);
     counts.judges.store(history.judges, Ordering::Relaxed);
     counts.session.store(session, Ordering::Release);
-    let Some(number) = number else {
+    let Some(drawn) = drawn else {
         return;
     };
     let mut players = 1;
@@ -412,8 +411,7 @@ unsafe fn gnw_judge_fighter_frame(ctx: &InlineCtx) {
         entry,
         session,
         &Judge {
-            number,
-            prev_number: prev_number(work_int(accessor, WORK_SPECIAL_S_PREV_KIND)),
+            drawn,
             players,
             hit: None,
             gw: snapshot,
@@ -501,8 +499,9 @@ fn append_rows(bytes: &[u8]) {
     file.write(bytes);
 }
 
-/// This boot's id for the `boot` column: the local time the writer started,
-/// `YYYYMMDD-hhmmss`, or the system tick when the clock is unset.
+/// This boot's id for the `boot` column: the local time of its first row,
+/// `YYYYMMDD-hhmmss` (the clock is not set yet when plugins load), or the
+/// system tick if it still is not.
 fn boot_id() -> Line<32> {
     use nn::time::{
         CalendarAdditionalInfo, CalendarTime, PosixTime, StandardUserSystemClock, TimeZone,
@@ -552,12 +551,25 @@ struct Writer {
 }
 
 impl Writer {
+    fn boot(&mut self) -> Line<32> {
+        if self.boot.as_bytes().is_empty() {
+            self.boot = boot_id();
+        }
+        let mut copy = Line::new();
+        let _ = copy.write_str(core::str::from_utf8(self.boot.as_bytes()).unwrap_or("-"));
+        copy
+    }
+
     fn drain_judges(&mut self) {
         let head = JUDGE_HEAD.load(Ordering::Acquire);
         if head.saturating_sub(self.judge_tail) > JUDGE_RING as u64 {
             self.judge_tail = head - JUDGE_RING as u64;
         }
-        let boot = core::str::from_utf8(self.boot.as_bytes()).unwrap_or("-");
+        if self.judge_tail == head {
+            return;
+        }
+        let boot_line = self.boot();
+        let boot = core::str::from_utf8(boot_line.as_bytes()).unwrap_or("-");
         let mut line = Line::<1024>::new();
         let mut batch = [0u8; 8192];
         let mut used = 0;
@@ -635,7 +647,14 @@ impl Writer {
     /// Writes a Judge whose side special was still running when the frames
     /// stopped (outcome unknown unless it had already connected).
     fn flush_pending(&mut self) {
-        let boot = core::str::from_utf8(self.boot.as_bytes()).unwrap_or("-");
+        if PENDING
+            .iter()
+            .all(|slot| slot.state.load(Ordering::Acquire) != PENDING_SET)
+        {
+            return;
+        }
+        let boot_line = self.boot();
+        let boot = core::str::from_utf8(boot_line.as_bytes()).unwrap_or("-");
         let mut line = Line::<1024>::new();
         for slot in &PENDING {
             if slot
@@ -708,7 +727,7 @@ impl Writer {
 
 extern "C" fn writer_main(_: *mut skyline::libc::c_void) {
     Writer {
-        boot: boot_id(),
+        boot: Line::new(),
         judge_tail: 0,
         note_tail: 0,
         reported: 0,

@@ -8,10 +8,12 @@ rows, adds a few derived columns and writes a CSV. Then prints how often each
 number came up and, per context (place, previous move, hit or not, damage...),
 how many 9s came up against how many a fair draw would give.
 
-A fair draw here means uniform over the numbers it can give: Judge never
-repeats the previous number, so each Judge has P(9) = 1/8 (0 right after a 9,
-1/9 for the first one). The script uses that per row, so contexts that follow
-a 9 more often are not mistaken for unlucky ones."""
+A fair draw here means uniform over the numbers it can give: Judge cannot
+repeat the number the game still holds as the previous one (`excluded`; the
+game clears it at the start of a match and after G&W is KO'd), so a Judge has
+P(9) = 1/8, 0 right after a 9 and 1/9 when nothing is excluded. The script
+uses that per row, so contexts that follow a 9 more often are not mistaken
+for unlucky ones. `repeat` = 1 when a Judge equals the previous one."""
 import argparse
 import csv
 import math
@@ -24,23 +26,24 @@ CONTEXTS = [
     'gw_prev', 'gw_prev_hit', 'gw_last_move', 'gw_last_move_motion', 'gw_last_move_hit',
     'opp_fighter', 'opp_status', 'opp_status_hit', 'opp_prev', 'opp_prev_hit',
     'opp_last_move', 'opp_last_move_motion', 'opp_last_move_hit',
-    'gw_damage_bin', 'opp_damage_bin', 'distance_bin', 'prev_number', 'judge_index_bin',
+    'gw_damage_bin', 'opp_damage_bin', 'distance_bin', 'excluded', 'last_number',
+    'judge_index_bin',
 ]
 
 
-def p_nine(prev_number):
-    """P(9) for a fair draw that cannot repeat the previous number."""
-    if prev_number == 9:
+def p_nine(excluded):
+    """P(9) for a fair draw that cannot give the excluded number."""
+    if excluded == 9:
         return 0.0
-    if prev_number == 0:
+    if excluded == 0:
         return 1 / 9
     return 1 / 8
 
 
-def p_number(number, prev_number):
-    if number == prev_number:
+def p_number(number, excluded):
+    if number == excluded:
         return 0.0
-    return 1 / 9 if prev_number == 0 else 1 / 8
+    return 1 / 9 if excluded == 0 else 1 / 8
 
 
 def read_rows(paths):
@@ -90,7 +93,8 @@ def derive(rows):
         row['opp_damage_bin'] = bin_of(opp, 30, 150)
         row['distance_bin'] = bin_of(number(row['distance']), 20, 100)
         row['judge_index_bin'] = str(min(row['judge_index'], 6)) + ('+' if row['judge_index'] >= 6 else '')
-        row['p_nine'] = round(p_nine(int(row['prev_number'])), 6)
+        row['p_nine'] = round(p_nine(int(row['excluded'])), 6)
+        row['repeat'] = int(row['number'] == row['last_number'])
 
 
 def chi2_sf(x, dof):
@@ -134,7 +138,7 @@ def summary(rows, minimum, out):
     if not n:
         return
     counts = Counter(int(r['number']) for r in rows)
-    expected = [sum(p_number(k, int(r['prev_number'])) for r in rows) for k in range(1, 10)]
+    expected = [sum(p_number(k, int(r['excluded'])) for r in rows) for k in range(1, 10)]
     write('number   count  expected')
     for k in range(1, 10):
         write(f'{k:>6} {counts[k]:>7} {expected[k - 1]:>9.1f}')

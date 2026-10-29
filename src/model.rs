@@ -1,13 +1,16 @@
 //! Host-testable half: the hook site, each fighter's recent actions, Judge
 //! detection, the record the hook hands to the writer, and the TSV row.
 //!
-//! Game & Watch keeps the panel of the current Judge in the instance work int
-//! `SPECIAL_S_KIND` (0..=8 for 1..9, -1 when none is showing) and the previous
-//! one in `SPECIAL_S_PREV_KIND`. `FighterSpecializer_GameWatch::init_panel`
-//! (`.text+0xa84470`) copies the first into the second and resets it to -1.
-//! The draw itself runs in G&W's fighter scripts (`lua2cpp_gamewatch`), so the
-//! plugin does not touch it: once per frame it reads the work int and reports
-//! a Judge when a number appears.
+//! Game & Watch's Judge panel is the instance work int `SPECIAL_S_KIND` (0..=8
+//! for 1..9, -1 for none); `FighterSpecializer_GameWatch::init_panel`
+//! (`.text+0xa84470`) copies it to `SPECIAL_S_PREV_KIND` and resets it to -1.
+//! The draw runs in G&W's fighter scripts (`lua2cpp_gamewatch`) and, as Eden
+//! shows, the number is drawn and moved within one frame: between frames
+//! `SPECIAL_S_KIND` is always -1 and `SPECIAL_S_PREV_KIND` holds the number
+//! of the Judge in progress (the G&W hit handler at `.text+0xa82660` reads it
+//! as such). So once per frame the plugin reads `SPECIAL_S_PREV_KIND`: a new
+//! value is a new Judge, and the value it replaced is the number the draw
+//! could not repeat. The plugin never touches the draw.
 
 use crate::names;
 use core::fmt;
@@ -222,8 +225,20 @@ pub struct History {
     pub last_move: Action,
     started: bool,
     panel: Option<i32>,
+    last_number: u8,
     pub special_s: u32,
     pub judges: u32,
+}
+
+/// A Judge number as it appeared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Drawn {
+    pub number: u8,
+    /// The number the game held as the previous panel when drawing, the one
+    /// it could not repeat; 0 when none (start of a match, after a KO).
+    pub excluded: u8,
+    /// The previous Judge's number in this session, 0 for the first.
+    pub last_number: u8,
 }
 
 impl History {
@@ -236,6 +251,7 @@ impl History {
             last_move: Action::NONE,
             started: false,
             panel: None,
+            last_number: 0,
             special_s: 0,
             judges: 0,
         }
@@ -280,14 +296,20 @@ impl History {
         true
     }
 
-    /// G&W's `SPECIAL_S_KIND` this frame; the Judge number 1..=9 when a panel
-    /// appeared since the last frame. The first value of a session only sets
-    /// the baseline.
-    pub fn panel(&mut self, kind: i32) -> Option<u8> {
-        let previous = self.panel.replace(kind)?;
-        if (0..=8).contains(&kind) && kind != previous {
+    /// G&W's `SPECIAL_S_PREV_KIND` this frame; a `Drawn` when it changed to a
+    /// panel since the last frame. The first value of a session only sets the
+    /// baseline.
+    pub fn panel(&mut self, prev_kind: i32) -> Option<Drawn> {
+        let previous = self.panel.replace(prev_kind)?;
+        if (0..=8).contains(&prev_kind) && prev_kind != previous {
             self.judges += 1;
-            return Some(kind as u8 + 1);
+            let number = prev_kind as u8 + 1;
+            let last_number = core::mem::replace(&mut self.last_number, number);
+            return Some(Drawn {
+                number,
+                excluded: panel_number(previous),
+                last_number,
+            });
         }
         None
     }
@@ -363,15 +385,13 @@ impl Snapshot {
     }
 }
 
-/// One Judge: the number, the number it could not be (the previous panel),
-/// what the Judge itself connected with, G&W and the opponent (the lowest
-/// other entry seen in the same session). Context is as of the frame the
-/// number appeared; `hit` is known once G&W leaves that side special.
+/// One Judge: its number (with the excluded and the previous number), what
+/// the Judge itself connected with, G&W and the opponent (the lowest other
+/// entry seen in the same session). Context is as of the frame the number
+/// appeared; `hit` is known once G&W leaves that side special.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Judge {
-    pub number: u8,
-    /// The previous panel's number, 0 when there was none.
-    pub prev_number: u8,
+    pub drawn: Drawn,
     /// Fighters seen this session, G&W included.
     pub players: u8,
     /// `None` while unknown (the session ended during the Judge).
@@ -386,11 +406,12 @@ const HIT_UNKNOWN: u64 = 0xff;
 impl Judge {
     pub fn to_words(&self) -> [u64; JUDGE_WORDS] {
         let mut words = [0; JUDGE_WORDS];
-        words[0] = u64::from(self.number)
-            | u64::from(self.prev_number) << 8
+        words[0] = u64::from(self.drawn.number)
+            | u64::from(self.drawn.excluded) << 8
             | u64::from(self.players) << 16
             | u64::from(self.opp.is_some()) << 24
-            | self.hit.map_or(HIT_UNKNOWN, Contact::code) << 32;
+            | self.hit.map_or(HIT_UNKNOWN, Contact::code) << 32
+            | u64::from(self.drawn.last_number) << 40;
         words[1..=SNAPSHOT_WORDS].copy_from_slice(&self.gw.to_words());
         if let Some(opp) = self.opp {
             words[1 + SNAPSHOT_WORDS..].copy_from_slice(&opp.to_words());
@@ -405,8 +426,11 @@ impl Judge {
             Snapshot::from_words(&w)
         };
         Judge {
-            number: words[0] as u8,
-            prev_number: (words[0] >> 8) as u8,
+            drawn: Drawn {
+                number: words[0] as u8,
+                excluded: (words[0] >> 8) as u8,
+                last_number: (words[0] >> 40) as u8,
+            },
             players: (words[0] >> 16) as u8,
             hit: match words[0] >> 32 & 0xff {
                 HIT_UNKNOWN => None,
@@ -440,8 +464,8 @@ pub fn outcome(drawn: Action, so_far: Contact, history: &History) -> Outcome {
     }
 }
 
-/// The previous panel as a Judge number, 0 for none.
-pub fn prev_number(prev_kind: i32) -> u8 {
+/// A panel as a Judge number, 0 for none.
+pub fn panel_number(prev_kind: i32) -> u8 {
     if (0..=8).contains(&prev_kind) {
         prev_kind as u8 + 1
     } else {
@@ -453,7 +477,8 @@ pub fn prev_number(prev_kind: i32) -> u8 {
 /// the frame the number appeared; `*_hit` = what that status's hitboxes
 /// connected with (`opp_status_hit`: so far). Statuses and motions are the
 /// game's names (hex when the name is not known).
-pub const HEADER: &str = "boot\tsession\tframe\tnumber\tnine\tprev_number\tjudge_hit\tplayers\t\
+pub const HEADER: &str = "boot\tsession\tframe\tnumber\tnine\texcluded\tlast_number\t\
+judge_hit\tplayers\t\
 gw_entry\tgw_place\tgw_damage\tgw_status\tgw_motion\tgw_status_ago\t\
 gw_prev\tgw_prev_motion\tgw_prev_ago\tgw_prev_hit\t\
 gw_last_move\tgw_last_move_motion\tgw_last_move_ago\tgw_last_move_hit\tgw_x\tgw_y\t\
@@ -548,11 +573,12 @@ pub fn write_row(
     let gw = &judge.gw;
     write!(
         out,
-        "{boot}\t{session}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}",
+        "{boot}\t{session}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}",
         gw.frame,
-        judge.number,
-        u8::from(judge.number == 9),
-        judge.prev_number,
+        judge.drawn.number,
+        u8::from(judge.drawn.number == 9),
+        judge.drawn.excluded,
+        judge.drawn.last_number,
         judge.hit.map_or("-", Contact::as_str),
         judge.players,
         gw.entry,
@@ -755,19 +781,27 @@ mod tests {
 
     #[test]
     fn a_panel_is_reported_once_per_draw() {
+        let drawn = |number, excluded, last_number| {
+            Some(Drawn {
+                number,
+                excluded,
+                last_number,
+            })
+        };
         let mut h = History::new();
-        assert_eq!(h.panel(-1), None); // baseline
+        assert_eq!(h.panel(-1), None); // baseline: no Judge yet this match
         assert_eq!(h.panel(-1), None);
-        assert_eq!(h.panel(8), Some(9));
-        assert_eq!(h.panel(8), None);
-        assert_eq!(h.panel(-1), None); // init_panel
-        assert_eq!(h.panel(2), Some(3));
-        assert_eq!(h.panel(5), Some(6)); // a new draw without a reset
-        assert_eq!(h.judges, 3);
+        assert_eq!(h.panel(8), drawn(9, 0, 0));
+        assert_eq!(h.panel(8), None); // the same Judge, later frames
+        assert_eq!(h.panel(2), drawn(3, 9, 9));
+        assert_eq!(h.panel(5), drawn(6, 3, 3));
+        assert_eq!(h.panel(-1), None); // cleared on a KO
+        assert_eq!(h.panel(5), drawn(6, 0, 6)); // a repeat is now possible
+        assert_eq!(h.judges, 4);
         let mut late = History::new();
         assert_eq!(late.panel(4), None); // already showing when first seen
-        assert_eq!(prev_number(8), 9);
-        assert_eq!(prev_number(-1), 0);
+        assert_eq!(panel_number(8), 9);
+        assert_eq!(panel_number(-1), 0);
     }
 
     #[test]
@@ -800,8 +834,11 @@ mod tests {
             contact,
         };
         Judge {
-            number: 9,
-            prev_number: 4,
+            drawn: Drawn {
+                number: 9,
+                excluded: 4,
+                last_number: 4,
+            },
             players: 2,
             hit: Some(Contact::Hit),
             gw: Snapshot {
@@ -857,7 +894,7 @@ mod tests {
         assert_eq!(row.split('\t').count(), columns, "{row}");
         assert_eq!(
             row,
-            "20261029-201500\t2\t600\t9\t1\t4\thit\t2\t0\tplatform\t37.5\
+            "20261029-201500\t2\t600\t9\t1\t4\t4\thit\t2\t0\tplatform\t37.5\
              \tspecial_s\tspecial_s\t2\tdash\tdash\t10\tnone\
              \tattack_air\tattack_air_f\t60\tshield\t-10.0\t35.2\
              \t1\tmario\tair\t82.0\tattack_air\tattack_air_b\t5\tnone\
@@ -873,7 +910,7 @@ mod tests {
         write_row(&mut line, "b", 1, &alone).unwrap();
         let row = core::str::from_utf8(line.as_bytes()).unwrap();
         assert_eq!(row.split('\t').count(), columns, "{row}");
-        assert!(row.starts_with("b\t1\t600\t9\t1\t4\t-\t2\t"), "{row}");
+        assert!(row.starts_with("b\t1\t600\t9\t1\t4\t4\t-\t2\t"), "{row}");
     }
 
     #[test]

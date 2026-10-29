@@ -57,8 +57,9 @@ entry_l entry_r rebirth final final_air final_start final_air_start
 item_light_get item_heavy_get item_light_throw_f item_light_throw_b
 item_light_throw_hi item_light_throw_lw item_light_throw_dash
 item_light_throw_air_f item_light_throw_air_b item_light_throw_air_hi
-item_light_throw_air_lw item_heavy_throw_f item_heavy_throw_b
-""".split()
+item_light_throw_air_lw item_heavy_throw_f item_heavy_throw_b damage_fall
+""".split() + [f'special_{air}s_{n}' for air in ('', 'air_') for n in range(1, 10)]
+# Game & Watch's Judge animation names carry the number (special_s_1..9).
 
 
 def consts(text, prefix):
