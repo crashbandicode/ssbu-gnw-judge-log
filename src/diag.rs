@@ -4,7 +4,7 @@
 //! The first call asking for 7..=9 from outside main also dumps the code
 //! around its caller (G&W's script), once, for disassembly.
 use super::{fighter_rng, push_note, read_u32, GW_SESSION, NOTE_DIAG_DUMP, SESSION, TEXT_BASE};
-use crate::model::Site;
+use crate::model::{Rng, Site};
 use core::cell::UnsafeCell;
 use skyline::hooks::InlineCtx;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -142,48 +142,89 @@ pub fn drain(tail: &mut u64, mut emit: impl FnMut(&[u8])) {
     }
 }
 
-/// Every fighter frame start in a G&W session: `session entry count`, in order,
-/// to place each fighter's update relative to the draws in `draws.tsv`.
+/// Every fighter frame start in a G&W session with the fighter stream's full
+/// state: `session entry frame count x:y:z:w`, in order. Places each
+/// fighter's update relative to the draws in `draws.tsv` and lets a host
+/// script check that the stream only ever moves by stepping forward.
 struct Frame {
     seq: AtomicU64,
-    /// session | entry << 32 | count's low 24 bits << 40
+    /// session | entry << 32 | frame's low 24 bits << 40
     a: AtomicU64,
+    /// x | y << 32
+    b: AtomicU64,
+    /// z | w << 32
+    c: AtomicU64,
+    /// count (`u32::MAX` when the stream could not be read)
+    d: AtomicU64,
 }
-static FRAMES: [Frame; RING] = [const {
+const FRAME_RING: usize = 4096;
+static FRAMES: [Frame; FRAME_RING] = [const {
     Frame {
         seq: AtomicU64::new(0),
         a: AtomicU64::new(0),
+        b: AtomicU64::new(0),
+        c: AtomicU64::new(0),
+        d: AtomicU64::new(0),
     }
-}; RING];
+}; FRAME_RING];
 static FRAME_HEAD: AtomicU64 = AtomicU64::new(0);
 
-pub fn note_frame(session: u32, entry: usize, count: u32) {
+pub fn note_frame(session: u32, entry: usize, frame: u32, rng: Option<Rng>) {
     let index = FRAME_HEAD.fetch_add(1, Ordering::AcqRel);
-    let slot = &FRAMES[(index % RING as u64) as usize];
+    let slot = &FRAMES[(index % FRAME_RING as u64) as usize];
+    let state = rng.unwrap_or_default();
     slot.a.store(
-        u64::from(session) | (entry as u64) << 32 | u64::from(count & 0xff_ffff) << 40,
+        u64::from(session) | (entry as u64) << 32 | u64::from(frame & 0xff_ffff) << 40,
+        Ordering::Relaxed,
+    );
+    slot.b.store(
+        u64::from(state.x) | u64::from(state.y) << 32,
+        Ordering::Relaxed,
+    );
+    slot.c.store(
+        u64::from(state.z) | u64::from(state.w) << 32,
+        Ordering::Relaxed,
+    );
+    slot.d.store(
+        u64::from(rng.map_or(u32::MAX, |rng| rng.count)),
         Ordering::Relaxed,
     );
     slot.seq.store(index + 1, Ordering::Release);
 }
 
-/// Rows for `frames.tsv` since `tail`: `session entry count`.
+/// Rows for `frames.tsv` since `tail`: `session entry frame count x:y:z:w`.
 pub fn drain_frames(tail: &mut u64, mut emit: impl FnMut(&[u8])) {
     use core::fmt::Write as _;
     let head = FRAME_HEAD.load(Ordering::Acquire);
-    if head.saturating_sub(*tail) > RING as u64 {
-        *tail = head - RING as u64;
+    if head.saturating_sub(*tail) > FRAME_RING as u64 {
+        *tail = head - FRAME_RING as u64;
     }
-    let mut line = crate::model::Line::<64>::new();
+    let mut line = crate::model::Line::<128>::new();
     while *tail < head {
-        let slot = &FRAMES[(*tail % RING as u64) as usize];
+        let slot = &FRAMES[(*tail % FRAME_RING as u64) as usize];
         if slot.seq.load(Ordering::Acquire) != *tail + 1 {
             break;
         }
-        let a = slot.a.load(Ordering::Relaxed);
+        let (a, b, c, d) = (
+            slot.a.load(Ordering::Relaxed),
+            slot.b.load(Ordering::Relaxed),
+            slot.c.load(Ordering::Relaxed),
+            slot.d.load(Ordering::Relaxed),
+        );
         *tail += 1;
         line.clear();
-        let _ = writeln!(line, "{}\t{}\t{}", a as u32, a >> 32 & 0xff, a >> 40);
+        let _ = writeln!(
+            line,
+            "{}\t{}\t{}\t{}\t{:08x}:{:08x}:{:08x}:{:08x}",
+            a as u32,
+            a >> 32 & 0xff,
+            a >> 40,
+            d as u32,
+            b as u32,
+            b >> 32,
+            c as u32,
+            c >> 32
+        );
         emit(line.as_bytes());
     }
 }

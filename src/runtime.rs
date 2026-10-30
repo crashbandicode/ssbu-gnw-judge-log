@@ -405,12 +405,6 @@ unsafe fn gnw_judge_fighter_frame(ctx: &InlineCtx) {
     if read_u32(fighter + OBJECT_ID as u64) != id_from_entry(entry as i32) {
         return;
     }
-    #[cfg(feature = "diag")]
-    diag::note_frame(
-        session,
-        entry,
-        fighter_rng().map_or(u32::MAX, |rng| rng.count),
-    );
     if FIRST_SEEN.swap(1, Ordering::AcqRel) == 0 {
         push_note(
             NOTE_FIRST,
@@ -443,6 +437,8 @@ unsafe fn gnw_judge_fighter_frame(ctx: &InlineCtx) {
         last_move: history.last_move,
     };
     publish(entry, &snapshot);
+    #[cfg(feature = "diag")]
+    diag::note_frame(session, entry, snapshot.frame, fighter_rng());
     if kind != FIGHTER_KIND_GAMEWATCH {
         return;
     }
