@@ -7,14 +7,21 @@
 //! allocates: the counting allocator below reports the plugin's heap
 //! allocations (expected 0) in `plugin.log`.
 use crate::model::{
-    self, outcome, write_row, Contact, History, Judge, Line, Outcome, Place, Site, Snapshot,
-    COLLISION_KIND_MASK_ATTACK, COLLISION_KIND_MASK_HIT, COLLISION_KIND_MASK_SHIELD, ENTRIES,
-    FIGHTER_FRAME, FIGHTER_KIND_GAMEWATCH, JUDGE_WORDS, OBJECT_ENTRY, OBJECT_ID, OBJECT_KIND,
-    OBJECT_MODULE_ACCESSOR, SNAPSHOT_WORDS, WORK_SPECIAL_S_KIND, WORK_SPECIAL_S_PREV_KIND,
+    self, outcome, panel_number, predict, write_row, write_segment, Contact, History, Judge, Line,
+    Outcome, Place, Rng, RngTrace, Segment, Site, Snapshot, COLLISION_KIND_MASK_ATTACK,
+    COLLISION_KIND_MASK_HIT, COLLISION_KIND_MASK_SHIELD, ENTRIES, FIGHTER_FRAME,
+    FIGHTER_KIND_GAMEWATCH, FIGHTER_STREAM, JUDGE_WORDS, OBJECT_ENTRY, OBJECT_ID, OBJECT_KIND,
+    OBJECT_MODULE_ACCESSOR, RNG_MANAGER, RNG_STATE_STRIDE, SEGMENT_HEADER, SEGMENT_WORDS,
+    SNAPSHOT_WORDS, WORK_SPECIAL_S_KIND, WORK_SPECIAL_S_PANEL_7_INVALID_FRAME,
+    WORK_SPECIAL_S_PREV_KIND,
 };
 use core::cell::UnsafeCell;
 use core::fmt::Write as _;
 use skyline::hooks::{getRegionAddress, InlineCtx, Region};
+
+#[cfg(feature = "diag")]
+#[path = "diag.rs"]
+mod diag;
 use skyline::nn;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
@@ -153,6 +160,8 @@ static PENDING: [PendingSlot; ENTRIES] = [const {
 
 const NOTE_GW: u8 = 1;
 const NOTE_FIRST: u8 = 2;
+#[cfg(feature = "diag")]
+const NOTE_DIAG_DUMP: u8 = 3;
 struct NoteSlot {
     seq: AtomicU64,
     tick: AtomicU64,
@@ -176,6 +185,44 @@ static SESSION: AtomicU32 = AtomicU32::new(0);
 static FIRST_SEEN: AtomicU32 = AtomicU32::new(0);
 /// The last session a Game & Watch played in.
 static GW_SESSION: AtomicU32 = AtomicU32::new(0);
+static TEXT_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Each G&W entry's fighter-stream state and "no 7" timer at the start of its
+/// last two frames (newest first). Owned by that entry's frame.
+static RNG_RING: [Owned<([Rng; 2], [i32; 2])>; ENTRIES] = [const {
+    Owned(UnsafeCell::new((
+        [Rng {
+            x: 0,
+            y: 0,
+            z: 0,
+            w: 0,
+            count: 0,
+        }; 2],
+        [0; 2],
+    )))
+}; ENTRIES];
+
+/// The fighter stream (`sv_math::rand(hash40("fighter"), n)`) as it is now;
+/// a copy, read only.
+unsafe fn fighter_rng() -> Option<Rng> {
+    let slot = TEXT_BASE.load(Ordering::Relaxed) + RNG_MANAGER as u64;
+    let manager = read_u64(read_u64(slot));
+    if manager < 0x10000 {
+        return None;
+    }
+    let (begin, end) = (read_u64(manager), read_u64(manager + 8));
+    let state = begin + FIGHTER_STREAM * RNG_STATE_STRIDE;
+    if begin < 0x10000 || end < state + RNG_STATE_STRIDE || end - begin > 64 * RNG_STATE_STRIDE {
+        return None;
+    }
+    Some(Rng {
+        x: read_u32(state),
+        y: read_u32(state + 4),
+        z: read_u32(state + 8),
+        w: read_u32(state + 0xc),
+        count: read_u32(state + 0x10),
+    })
+}
 
 /// The writer thread's object and stack, static so no heap is involved.
 #[repr(C, align(4096))]
@@ -392,7 +439,29 @@ unsafe fn gnw_judge_fighter_frame(ctx: &InlineCtx) {
         return;
     }
     follow_pending(entry, session, history);
+    let rng = fighter_rng();
+    let rng_now = rng.unwrap_or_default();
+    let seven = work_int(accessor, WORK_SPECIAL_S_PANEL_7_INVALID_FRAME);
+    // SAFETY: only this entry's own frame touches its ring.
+    let ring = &mut *RNG_RING[entry].0.get();
+    let trace = RngTrace {
+        at_draw: ring.0[0],
+        before: ring.0[1],
+        count_after: rng_now.count,
+        seven_block: ring.1[0],
+    };
+    *ring = ([rng_now, ring.0[0]], [seven, ring.1[0]]);
     let panel = work_int(accessor, WORK_SPECIAL_S_PREV_KIND);
+    if let Some(rng) = rng {
+        track_segment(
+            entry,
+            session,
+            &snapshot,
+            rng,
+            panel_number(panel),
+            seven > 0,
+        );
+    }
     if history.frame == 1 {
         let kind = work_int(accessor, WORK_SPECIAL_S_KIND);
         push_note(
@@ -409,15 +478,8 @@ unsafe fn gnw_judge_fighter_frame(ctx: &InlineCtx) {
     let Some(drawn) = drawn else {
         return;
     };
-    let mut players = 1;
-    let mut opp = None;
-    for other in (0..ENTRIES).filter(|other| *other != entry) {
-        if let Some(seen) = snapshot_of(other).filter(|seen| seen.session == session) {
-            players += 1;
-            opp = opp.or(Some(seen));
-        }
-    }
     // Only 1v1 matches are logged.
+    let (players, opp) = opponents(entry, session);
     if players != 2 {
         return;
     }
@@ -430,8 +492,100 @@ unsafe fn gnw_judge_fighter_frame(ctx: &InlineCtx) {
             hit: None,
             gw: snapshot,
             opp,
+            rng: trace,
         },
     );
+}
+
+/// Fighters in `session` (G&W's entry included) and the lowest other entry.
+fn opponents(entry: usize, session: u32) -> (u8, Option<Snapshot>) {
+    let mut players = 1;
+    let mut opp = None;
+    for other in (0..ENTRIES).filter(|other| *other != entry) {
+        if let Some(seen) = snapshot_of(other).filter(|seen| seen.session == session) {
+            players += 1;
+            opp = opp.or(Some(seen));
+        }
+    }
+    (players, opp)
+}
+
+/// The stream state G&W is living through, with the segment it opened.
+struct OpenSegment {
+    rng: Rng,
+    segment: Segment,
+}
+
+static SEGMENTS: [Owned<Option<OpenSegment>>; ENTRIES] =
+    [const { Owned(UnsafeCell::new(None)) }; ENTRIES];
+
+/// Closes G&W's segment when the fighter stream (or the excluded number, or
+/// the "no 7" timer) changed, queuing it, and opens the next one in a 1v1.
+unsafe fn track_segment(
+    entry: usize,
+    session: u32,
+    gw: &Snapshot,
+    rng: Rng,
+    excluded: u8,
+    seven_blocked: bool,
+) {
+    // SAFETY: only this entry's own frame touches its segment.
+    let open = &mut *SEGMENTS[entry].0.get();
+    if open.as_ref().is_some_and(|o| {
+        o.rng == rng
+            && o.segment.session == session
+            && o.segment.excluded == excluded
+            && o.segment.seven_blocked == seven_blocked
+    }) {
+        return;
+    }
+    if let Some(closed) = open.take().filter(|o| o.segment.session == session) {
+        let mut segment = closed.segment;
+        segment.frames = gw.frame.wrapping_sub(segment.start);
+        segment.end_draws = rng.count.wrapping_sub(closed.rng.count);
+        push_segment(&segment);
+    }
+    let (players, opp) = opponents(entry, session);
+    if players != 2 {
+        return;
+    }
+    *open = Some(OpenSegment {
+        rng,
+        segment: Segment {
+            session,
+            start: gw.frame,
+            frames: 0,
+            predicted: predict(rng, excluded, seven_blocked),
+            excluded,
+            seven_blocked,
+            end_draws: 0,
+            stage: stage_id() as u16,
+            gw: *gw,
+            opp,
+        },
+    });
+}
+
+struct SegmentSlot {
+    seq: AtomicU64,
+    words: [AtomicU64; SEGMENT_WORDS],
+}
+const SEGMENT_RING: usize = 256;
+static SEGMENT_SLOTS: [SegmentSlot; SEGMENT_RING] = [const {
+    SegmentSlot {
+        seq: AtomicU64::new(0),
+        words: [const { AtomicU64::new(0) }; SEGMENT_WORDS],
+    }
+}; SEGMENT_RING];
+static SEGMENT_HEAD: AtomicU64 = AtomicU64::new(0);
+
+fn push_segment(segment: &Segment) {
+    let index = SEGMENT_HEAD.fetch_add(1, Ordering::AcqRel);
+    let slot = &SEGMENT_SLOTS[(index % SEGMENT_RING as u64) as usize];
+    for (cell, word) in slot.words.iter().zip(segment.to_words()) {
+        cell.store(word, Ordering::Relaxed);
+    }
+    slot.seq.store(index + 1, Ordering::Release);
 }
 
 type Path = Line<96>;
@@ -496,6 +650,14 @@ impl Drop for NxFile {
     }
 }
 
+/// Appends to a file in the data folder (diagnostics).
+#[cfg(feature = "diag")]
+fn append_file(name: &str, bytes: &[u8]) {
+    if let Some(mut file) = NxFile::append(&mut path(format_args!("{DATA_DIR}/{name}"))) {
+        file.write(bytes);
+    }
+}
+
 fn append_log(bytes: &[u8]) {
     if let Some(mut log) = NxFile::append(&mut path(format_args!("{DATA_DIR}/plugin.log"))) {
         log.write(bytes);
@@ -508,6 +670,17 @@ fn append_rows(bytes: &[u8]) {
         return;
     };
     if file.offset == 0 && !(file.write(model::HEADER.as_bytes()) && file.write(b"\n")) {
+        return;
+    }
+    file.write(bytes);
+}
+
+/// Appends rows to `windows.tsv`, writing the header first into a new file.
+fn append_segments(bytes: &[u8]) {
+    let Some(mut file) = NxFile::append(&mut path(format_args!("{DATA_DIR}/windows.tsv"))) else {
+        return;
+    };
+    if file.offset == 0 && !(file.write(SEGMENT_HEADER.as_bytes()) && file.write(b"\n")) {
         return;
     }
     file.write(bytes);
@@ -560,6 +733,11 @@ fn boot_id() -> Line<32> {
 struct Writer {
     boot: Line<32>,
     judge_tail: u64,
+    segment_tail: u64,
+    #[cfg(feature = "diag")]
+    draw_tail: u64,
+    #[cfg(feature = "diag")]
+    dump_written: bool,
     note_tail: u64,
     reported: u32,
 }
@@ -572,6 +750,68 @@ impl Writer {
         let mut copy = Line::new();
         let _ = copy.write_str(core::str::from_utf8(self.boot.as_bytes()).unwrap_or("-"));
         copy
+    }
+
+    #[cfg(feature = "diag")]
+    fn drain_diag(&mut self) {
+        let mut batch = [0u8; 16384];
+        let mut used = 0;
+        diag::drain(&mut self.draw_tail, |line| {
+            if used + line.len() > batch.len() {
+                append_file("draws.tsv", &batch[..used]);
+                used = 0;
+            }
+            batch[used..used + line.len()].copy_from_slice(line);
+            used += line.len();
+        });
+        if used > 0 {
+            append_file("draws.tsv", &batch[..used]);
+        }
+        if !self.dump_written {
+            if let Some(code) = diag::dump() {
+                append_file("judge_code.bin", code);
+                self.dump_written = true;
+            }
+        }
+    }
+
+    fn drain_segments(&mut self) {
+        let head = SEGMENT_HEAD.load(Ordering::Acquire);
+        if head.saturating_sub(self.segment_tail) > SEGMENT_RING as u64 {
+            self.segment_tail = head - SEGMENT_RING as u64;
+        }
+        if self.segment_tail == head {
+            return;
+        }
+        let boot_line = self.boot();
+        let boot = core::str::from_utf8(boot_line.as_bytes()).unwrap_or("-");
+        let mut line = Line::<1024>::new();
+        let mut batch = [0u8; 8192];
+        let mut used = 0;
+        while self.segment_tail < head {
+            let slot = &SEGMENT_SLOTS[(self.segment_tail % SEGMENT_RING as u64) as usize];
+            if slot.seq.load(Ordering::Acquire) != self.segment_tail + 1 {
+                break;
+            }
+            let mut words = [0; SEGMENT_WORDS];
+            for (word, cell) in words.iter_mut().zip(&slot.words) {
+                *word = cell.load(Ordering::Relaxed);
+            }
+            self.segment_tail += 1;
+            line.clear();
+            let _ = write_segment(&mut line, boot, &Segment::from_words(&words));
+            let _ = line.write_char('\n');
+            let text = line.as_bytes();
+            if used + text.len() > batch.len() {
+                append_segments(&batch[..used]);
+                used = 0;
+            }
+            batch[used..used + text.len()].copy_from_slice(text);
+            used += text.len();
+        }
+        if used > 0 {
+            append_segments(&batch[..used]);
+        }
     }
 
     fn drain_judges(&mut self) {
@@ -643,6 +883,8 @@ impl Writer {
                     a >> 32,
                     b
                 ),
+                #[cfg(feature = "diag")]
+                NOTE_DIAG_DUMP => write!(line, "{when} diag_dump start={a:#x} caller={b:#x}"),
                 NOTE_GW => write!(
                     line,
                     "{when} gamewatch session={} entry={} panel={} prev_panel={}",
@@ -740,6 +982,9 @@ impl Writer {
             };
             self.drain_notes();
             self.drain_judges();
+            self.drain_segments();
+            #[cfg(feature = "diag")]
+            self.drain_diag();
             self.report_session();
         }
     }
@@ -749,6 +994,11 @@ extern "C" fn writer_main(_: *mut skyline::libc::c_void) {
     Writer {
         boot: Line::new(),
         judge_tail: 0,
+        segment_tail: 0,
+        #[cfg(feature = "diag")]
+        draw_tail: 0,
+        #[cfg(feature = "diag")]
+        dump_written: false,
         note_tail: 0,
         reported: 0,
     }
@@ -830,8 +1080,16 @@ pub fn main() {
     }
     // The writer appends to the same log, so it starts after this line (and
     // the folder) exist; the hook only fills rings until then.
+    TEXT_BASE.store(
+        unsafe { getRegionAddress(Region::Text) as u64 },
+        Ordering::Relaxed,
+    );
     skyline::install_hook!(gnw_judge_fighter_frame);
     let _ = write!(report, " hooks={}", FIGHTER_FRAME.name);
+    #[cfg(feature = "diag")]
+    if diag::install() {
+        let _ = write!(report, ",{}", diag::SV_MATH_RAND.name);
+    }
     report_install(&mut report);
     if !start_writer() {
         report.clear();

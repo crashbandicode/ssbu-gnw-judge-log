@@ -51,6 +51,14 @@ pub const FIGHTER_KIND_GAMEWATCH: u32 = names::GAMEWATCH;
 pub const STATUS_SPECIAL_S: i32 = 0x1dd;
 pub const WORK_SPECIAL_S_KIND: i32 = 0x1000_00c2;
 pub const WORK_SPECIAL_S_PREV_KIND: i32 = 0x1000_00c1;
+/// Frames left in which a Judge cannot be a 7 (after a 7 hits).
+pub const WORK_SPECIAL_S_PANEL_7_INVALID_FRAME: i32 = 0x1000_00c5;
+/// `.text` slot holding a pointer to the RNG manager pointer; the manager
+/// starts with a `[begin, end)` vector of 20-byte stream states. Stream 1 is
+/// `fighter`, the one `sv_math::rand(hash40("fighter"), n)` draws from.
+pub const RNG_MANAGER: usize = 0x52c35b0;
+pub const RNG_STATE_STRIDE: u64 = 0x14;
+pub const FIGHTER_STREAM: u64 = 1;
 pub const SITUATION_GROUND: i32 = 0;
 pub const SITUATION_CLIFF: i32 = 1;
 pub const SITUATION_AIR: i32 = 2;
@@ -385,6 +393,89 @@ impl Snapshot {
     }
 }
 
+/// The game's `fighter` RNG stream (index 1 of the RNG manager): xorshift128
+/// state and draw counter, laid out as in memory (`+0x0..+0x10`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Rng {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+    pub w: u32,
+    pub count: u32,
+}
+
+impl Rng {
+    /// The next raw output, exactly as `sv_math::rand` (`.text+0x2275660`)
+    /// computes it, advancing this copy (never the game's).
+    pub fn step(&mut self) -> u32 {
+        let t = self.x ^ self.x << 11;
+        let t = t ^ t >> 8;
+        let out = t ^ self.w ^ self.w >> 19;
+        (self.x, self.y, self.z, self.w) = (self.y, self.z, self.w, out);
+        self.count = self.count.wrapping_add(1);
+        out
+    }
+
+    /// `sv_math::rand(hash, n)`: the next output modulo `n`.
+    pub fn rand(&mut self, n: u32) -> u32 {
+        let out = self.step();
+        if n >= 1 {
+            out % n
+        } else {
+            out
+        }
+    }
+}
+
+/// The fighter stream around a Judge: at the start of G&W's frame in which
+/// the number was drawn (`at_draw`), one frame earlier (`before`), the draw
+/// count at the start of the next frame, and G&W's "no 7" timer
+/// (`SPECIAL_S_PANEL_7_INVALID_FRAME`) at the draw frame.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RngTrace {
+    pub at_draw: Rng,
+    pub before: Rng,
+    pub count_after: u32,
+    pub seven_block: i32,
+}
+
+impl RngTrace {
+    fn to_words(self) -> [u64; 6] {
+        let pair = |a: u32, b: u32| u64::from(a) | u64::from(b) << 32;
+        let (d, b) = (self.at_draw, self.before);
+        [
+            pair(d.x, d.y),
+            pair(d.z, d.w),
+            pair(d.count, self.count_after),
+            pair(b.x, b.y),
+            pair(b.z, b.w),
+            pair(b.count, self.seven_block as u32),
+        ]
+    }
+
+    fn from_words(w: &[u64]) -> Self {
+        let (lo, hi) = (|v: u64| v as u32, |v: u64| (v >> 32) as u32);
+        RngTrace {
+            at_draw: Rng {
+                x: lo(w[0]),
+                y: hi(w[0]),
+                z: lo(w[1]),
+                w: hi(w[1]),
+                count: lo(w[2]),
+            },
+            count_after: hi(w[2]),
+            before: Rng {
+                x: lo(w[3]),
+                y: hi(w[3]),
+                z: lo(w[4]),
+                w: hi(w[4]),
+                count: lo(w[5]),
+            },
+            seven_block: hi(w[5]) as i32,
+        }
+    }
+}
+
 /// One Judge: its number (with the excluded and the previous number), what
 /// the Judge itself connected with, G&W and the opponent (the lowest other
 /// entry seen in the same session). Context is as of the frame the number
@@ -398,9 +489,11 @@ pub struct Judge {
     pub hit: Option<Contact>,
     pub gw: Snapshot,
     pub opp: Option<Snapshot>,
+    pub rng: RngTrace,
 }
 
-pub const JUDGE_WORDS: usize = 1 + 2 * SNAPSHOT_WORDS;
+pub const JUDGE_WORDS: usize = 1 + 2 * SNAPSHOT_WORDS + 6;
+const RNG_AT: usize = 1 + 2 * SNAPSHOT_WORDS;
 const HIT_UNKNOWN: u64 = 0xff;
 
 impl Judge {
@@ -414,8 +507,9 @@ impl Judge {
             | u64::from(self.stage) << 48;
         words[1..=SNAPSHOT_WORDS].copy_from_slice(&self.gw.to_words());
         if let Some(opp) = self.opp {
-            words[1 + SNAPSHOT_WORDS..].copy_from_slice(&opp.to_words());
+            words[1 + SNAPSHOT_WORDS..RNG_AT].copy_from_slice(&opp.to_words());
         }
+        words[RNG_AT..].copy_from_slice(&self.rng.to_words());
         words
     }
 
@@ -438,6 +532,143 @@ impl Judge {
             },
             gw: snapshot(1),
             opp: (words[0] >> 24 & 1 != 0).then(|| snapshot(1 + SNAPSHOT_WORDS)),
+            rng: RngTrace::from_words(&words[RNG_AT..]),
+        }
+    }
+}
+
+/// The Judge number for one fighter-stream output: the numbers the draw may
+/// give (1..=9 without `excluded`, and without 7 while `seven_blocked`) in
+/// order, indexed by the output modulo how many there are. Fitted on Eden
+/// Judges and checked forward by the `predicted` column, not taken from the
+/// game's script.
+pub fn judge_number(output: u32, excluded: u8, seven_blocked: bool) -> u8 {
+    let mut allowed = [0u8; 9];
+    let mut count = 0;
+    for number in 1..=9u8 {
+        if number != excluded && !(seven_blocked && number == 7) {
+            allowed[count] = number;
+            count += 1;
+        }
+    }
+    allowed[(output % count as u32) as usize]
+}
+
+/// What a side special started now would show: the next output of `rng`.
+pub fn predict(rng: Rng, excluded: u8, seven_blocked: bool) -> u8 {
+    let mut copy = rng;
+    judge_number(copy.step(), excluded, seven_blocked)
+}
+
+/// One stream state as G&W saw it on consecutive frames: the number a side
+/// special would have shown on any of them, and the context on the first.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Segment {
+    pub session: u32,
+    pub start: u32,
+    pub frames: u32,
+    pub predicted: u8,
+    pub excluded: u8,
+    pub seven_blocked: bool,
+    /// Fighter-stream draws that ended it (0: the excluded number changed).
+    pub end_draws: u32,
+    pub stage: u16,
+    pub gw: Snapshot,
+    pub opp: Option<Snapshot>,
+}
+
+pub const SEGMENT_WORDS: usize = 3 + 2 * SNAPSHOT_WORDS;
+
+impl Segment {
+    pub fn to_words(&self) -> [u64; SEGMENT_WORDS] {
+        let mut words = [0; SEGMENT_WORDS];
+        words[0] = u64::from(self.session) | u64::from(self.start) << 32;
+        words[1] = u64::from(self.frames) | u64::from(self.end_draws) << 32;
+        words[2] = u64::from(self.predicted)
+            | u64::from(self.excluded) << 8
+            | u64::from(self.seven_blocked) << 16
+            | u64::from(self.opp.is_some()) << 17
+            | u64::from(self.stage) << 32;
+        words[3..3 + SNAPSHOT_WORDS].copy_from_slice(&self.gw.to_words());
+        if let Some(opp) = self.opp {
+            words[3 + SNAPSHOT_WORDS..].copy_from_slice(&opp.to_words());
+        }
+        words
+    }
+
+    pub fn from_words(words: &[u64; SEGMENT_WORDS]) -> Self {
+        let snapshot = |at: usize| {
+            let mut w = [0; SNAPSHOT_WORDS];
+            w.copy_from_slice(&words[at..at + SNAPSHOT_WORDS]);
+            Snapshot::from_words(&w)
+        };
+        Segment {
+            session: words[0] as u32,
+            start: (words[0] >> 32) as u32,
+            frames: words[1] as u32,
+            end_draws: (words[1] >> 32) as u32,
+            predicted: words[2] as u8,
+            excluded: (words[2] >> 8) as u8,
+            seven_blocked: words[2] >> 16 & 1 != 0,
+            stage: (words[2] >> 32) as u16,
+            gw: snapshot(3),
+            opp: (words[2] >> 17 & 1 != 0).then(|| snapshot(3 + SNAPSHOT_WORDS)),
+        }
+    }
+}
+
+/// Columns of `windows.tsv`: one row per fighter-stream state G&W lived
+/// through in a 1v1 (`predicted` = what a side special would have shown).
+pub const SEGMENT_HEADER: &str = "boot\tsession\tstart_frame\tframes\tpredicted\tnine\t\
+excluded\tseven_block\tend_draws\tstage\tgw_place\tgw_damage\tgw_status\tgw_motion\t\
+gw_status_ago\tgw_prev\tgw_prev_motion\tgw_prev_ago\tgw_prev_hit\tgw_last_move\t\
+gw_last_move_motion\tgw_last_move_ago\tgw_last_move_hit\topp_fighter\topp_place\t\
+opp_damage\topp_status\topp_motion\topp_status_ago\topp_status_hit\topp_prev\t\
+opp_prev_motion\topp_prev_ago\topp_prev_hit\topp_last_move\topp_last_move_motion\t\
+opp_last_move_ago\topp_last_move_hit\tdistance";
+
+/// One `windows.tsv` row (no newline).
+pub fn write_segment(out: &mut impl fmt::Write, boot: &str, segment: &Segment) -> fmt::Result {
+    let gw = &segment.gw;
+    write!(
+        out,
+        "{boot}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}",
+        segment.session,
+        segment.start,
+        segment.frames,
+        segment.predicted,
+        u8::from(segment.predicted == 9),
+        segment.excluded,
+        u8::from(segment.seven_blocked),
+        segment.end_draws,
+        StageName(segment.stage),
+        gw.place.as_str(),
+        gw.damage,
+    )?;
+    write_action(out, gw, gw.cur, false)?;
+    write_action(out, gw, gw.prev, true)?;
+    write_action(out, gw, gw.last_move, true)?;
+    match &segment.opp {
+        Some(opp) => {
+            write!(
+                out,
+                "\t{}\t{}\t{:.1}",
+                fighter_name(opp.fighter),
+                opp.place.as_str(),
+                opp.damage
+            )?;
+            write_action(out, opp, opp.cur, true)?;
+            write_action(out, opp, opp.prev, true)?;
+            write_action(out, opp, opp.last_move, true)?;
+            let distance = ((opp.x - gw.x).powi(2) + (opp.y - gw.y).powi(2)).sqrt();
+            write!(out, "\t{distance:.1}")
+        }
+        None => {
+            // fighter, place, damage, 3 actions x 4, distance
+            for _ in 0..16 {
+                out.write_str("\t-")?;
+            }
+            Ok(())
         }
     }
 }
@@ -486,7 +717,8 @@ opp_entry\topp_fighter\topp_place\topp_damage\t\
 opp_status\topp_motion\topp_status_ago\topp_status_hit\t\
 opp_prev\topp_prev_motion\topp_prev_ago\topp_prev_hit\t\
 opp_last_move\topp_last_move_motion\topp_last_move_ago\topp_last_move_hit\t\
-opp_x\topp_y\tdistance";
+opp_x\topp_y\tdistance\tpredicted\t\
+rng_draw\trng_draw_count\trng_before\trng_before_count\trng_count_after\tseven_block";
 
 struct StatusName(u32, i32);
 
@@ -617,15 +849,40 @@ pub fn write_row(
             write_action(out, opp, opp.prev, true)?;
             write_action(out, opp, opp.last_move, true)?;
             let distance = ((opp.x - gw.x).powi(2) + (opp.y - gw.y).powi(2)).sqrt();
-            write!(out, "\t{:.1}\t{:.1}\t{distance:.1}", opp.x, opp.y)
+            write!(out, "\t{:.1}\t{:.1}\t{distance:.1}", opp.x, opp.y)?;
         }
         None => {
             // entry, fighter, place, damage, 3 actions x 4, x, y, distance
             for _ in 0..19 {
                 out.write_str("\t-")?;
             }
-            Ok(())
         }
+    }
+    let state = |r: Rng| RngState(r.x, r.y, r.z, r.w);
+    let trace = judge.rng;
+    let predicted = predict(trace.at_draw, judge.drawn.excluded, trace.seven_block > 0);
+    write!(
+        out,
+        "\t{predicted}\t{}\t{}\t{}\t{}\t{}\t{}",
+        state(trace.at_draw),
+        trace.at_draw.count,
+        state(trace.before),
+        trace.before.count,
+        trace.count_after,
+        trace.seven_block
+    )
+}
+
+/// A stream state as `xxxxxxxx:yyyyyyyy:zzzzzzzz:wwwwwwww`.
+struct RngState(u32, u32, u32, u32);
+
+impl fmt::Display for RngState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{:08x}:{:08x}:{:08x}:{:08x}",
+            self.0, self.1, self.2, self.3
+        )
     }
 }
 
@@ -887,6 +1144,105 @@ mod tests {
                 prev: action(0x0c, "jump_aerial_f", 585, NONE),
                 last_move: action(0x27, "attack_13", 500, Contact::Hit),
             }),
+            rng: RngTrace {
+                at_draw: Rng {
+                    x: 1,
+                    y: 2,
+                    z: 3,
+                    w: 4,
+                    count: 7,
+                },
+                before: Rng {
+                    x: 5,
+                    y: 6,
+                    z: 7,
+                    w: 8,
+                    count: 6,
+                },
+                count_after: 9,
+                seven_block: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn rng_steps_like_sv_math_rand() {
+        let mut rng = Rng {
+            x: 1,
+            y: 2,
+            z: 3,
+            w: 4,
+            count: 0,
+        };
+        assert_eq!(rng.step(), 0x80d);
+        assert_eq!((rng.x, rng.y, rng.z, rng.w, rng.count), (2, 3, 4, 0x80d, 1));
+        assert_eq!(rng.rand(9), 0x181f % 9);
+        assert_eq!(rng.count, 2);
+    }
+
+    #[test]
+    fn judge_numbers_skip_the_excluded_and_blocked_7() {
+        assert_eq!(judge_number(8, 0, false), 9);
+        assert_eq!(judge_number(8, 9, false), 1);
+        assert_eq!(judge_number(6, 3, true), 9);
+        assert_eq!(judge_number(5, 7, false), 6);
+    }
+
+    /// Eden, 2026-10-29 (run g20): the fighter stream at the start of the
+    /// draw frame, the excluded number, and the Judge the game showed.
+    #[test]
+    fn eden_judges_are_predicted() {
+        let observed = [
+            ([0x7bc45005, 0xcfc5782f, 0x04de0281, 0x44b7f967], 0, 2),
+            ([0xd46a25da, 0x9fbd67d0, 0xd065480c, 0x91b5c6dd], 0, 2),
+            ([0x3df1294f, 0xb2881d98, 0x0f0fdca8, 0x686453a7], 2, 7),
+            ([0x84be6088, 0xc1048bbe, 0x07a5d20d, 0x99d280f6], 0, 7),
+            ([0xd281f80b, 0x78060ccd, 0xe84e9cca, 0xa066aef2], 7, 6),
+        ];
+        for ([x, y, z, w], excluded, number) in observed {
+            let rng = Rng {
+                x,
+                y,
+                z,
+                w,
+                count: 0,
+            };
+            assert_eq!(predict(rng, excluded, false), number);
+        }
+    }
+
+    #[test]
+    fn segments_round_trip_and_fill_their_columns() {
+        let judge = sample();
+        let segment = Segment {
+            session: 2,
+            start: 590,
+            frames: 41,
+            predicted: 9,
+            excluded: 4,
+            seven_blocked: true,
+            end_draws: 3,
+            stage: 0x15b,
+            gw: judge.gw,
+            opp: judge.opp,
+        };
+        assert_eq!(Segment::from_words(&segment.to_words()), segment);
+        let columns = SEGMENT_HEADER.split('\t').count();
+        for segment in [
+            segment,
+            Segment {
+                opp: None,
+                ..segment
+            },
+        ] {
+            let mut line = Line::<1024>::new();
+            write_segment(&mut line, "b", &segment).unwrap();
+            let row = core::str::from_utf8(line.as_bytes()).unwrap();
+            assert_eq!(row.split('\t').count(), columns, "{row}");
+            assert!(
+                row.starts_with("b\t2\t590\t41\t9\t1\t4\t1\t3\tbattlefield_s\t"),
+                "{row}"
+            );
         }
     }
 
@@ -919,7 +1275,7 @@ mod tests {
              \tattack_air\tattack_air_f\t60\tshield\t-10.0\t35.2\
              \t1\tmario\tair\t82.0\tattack_air\tattack_air_b\t5\tnone\
              \tjump_aerial\tjump_aerial_f\t15\tnone\tattack\tattack_13\t100\thit\
-             \t20.0\t75.2\t50.0"
+             \t20.0\t75.2\t50.0\t7\t00000001:00000002:00000003:00000004\t7\t00000005:00000006:00000007:00000008\t6\t9\t0"
         );
         line.clear();
         let alone = Judge {
