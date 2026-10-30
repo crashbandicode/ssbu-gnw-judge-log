@@ -40,6 +40,26 @@ move, hit or not, damage...), the 9s seen against what a fair draw gives. The
 game never repeats the number it holds as the previous one (it forgets it when
 G&W is KO'd), so a fair draw gives a 9 one time in 8.
 
+## The 9 window
+
+A Judge's number is fixed by the game's fighter RNG stream at the moment of
+the draw (read from G&W's own script; [docs/HOOKS.md](docs/HOOKS.md)). The
+plugin computes, every frame, what a side special started then would show:
+the `predicted` column matched 34 of 35 Judges in Eden before they happened,
+and `windows.tsv` records every state with its number and context.
+
+The stream changes whenever fighter code draws from it (about every 2 frames
+in a fight), and each new state is a fair pick. Across six Eden matches (6,468
+states) no context predicted a 9 beyond chance:
+
+```text
+python3 tools/window_table.py windows.tsv
+```
+
+What does hold, from the formula: 0 % right after a 9, 1/9 with nothing
+excluded (first Judge of a match, after G&W is KO'd), 1/8 normally, 1/7 within
+150 frames of a 7 hitting if your last Judge was not that 7.
+
 ## Install
 
 Copy `libssbu_gnw_judge_log.nro` to

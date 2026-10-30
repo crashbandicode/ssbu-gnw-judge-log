@@ -537,11 +537,15 @@ impl Judge {
     }
 }
 
-/// The Judge number for one fighter-stream output: the numbers the draw may
-/// give (1..=9 without `excluded`, and without 7 while `seven_blocked`) in
-/// order, indexed by the output modulo how many there are. Fitted on Eden
-/// Judges and checked forward by the `predicted` column, not taken from the
-/// game's script.
+/// The Judge number for one fighter-stream output, as G&W's script picks it
+/// (`lua2cpp_gamewatch`, read from a code dump of 13.0.5 in Eden): each panel
+/// 0..=8 gets a weight from `param_special_s` (1 for all of them in vanilla:
+/// every logged draw asked `sv_math::rand(hash40("fighter"), n)` for exactly
+/// as many values as panels allowed), 0 for the previous panel and 0 for
+/// panel 7 while `SPECIAL_S_PANEL_7_INVALID_FRAME` > 0; the draw is the output
+/// modulo the total weight, and the panel is the first whose running total
+/// exceeds it. With weights of 1 that is the allowed numbers in order,
+/// indexed by the output modulo how many there are.
 pub fn judge_number(output: u32, excluded: u8, seven_blocked: bool) -> u8 {
     let mut allowed = [0u8; 9];
     let mut count = 0;

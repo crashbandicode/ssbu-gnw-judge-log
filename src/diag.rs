@@ -142,6 +142,52 @@ pub fn drain(tail: &mut u64, mut emit: impl FnMut(&[u8])) {
     }
 }
 
+/// Every fighter frame start in a G&W session: `session entry count`, in order,
+/// to place each fighter's update relative to the draws in `draws.tsv`.
+struct Frame {
+    seq: AtomicU64,
+    /// session | entry << 32 | count's low 24 bits << 40
+    a: AtomicU64,
+}
+static FRAMES: [Frame; RING] = [const {
+    Frame {
+        seq: AtomicU64::new(0),
+        a: AtomicU64::new(0),
+    }
+}; RING];
+static FRAME_HEAD: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_frame(session: u32, entry: usize, count: u32) {
+    let index = FRAME_HEAD.fetch_add(1, Ordering::AcqRel);
+    let slot = &FRAMES[(index % RING as u64) as usize];
+    slot.a.store(
+        u64::from(session) | (entry as u64) << 32 | u64::from(count & 0xff_ffff) << 40,
+        Ordering::Relaxed,
+    );
+    slot.seq.store(index + 1, Ordering::Release);
+}
+
+/// Rows for `frames.tsv` since `tail`: `session entry count`.
+pub fn drain_frames(tail: &mut u64, mut emit: impl FnMut(&[u8])) {
+    use core::fmt::Write as _;
+    let head = FRAME_HEAD.load(Ordering::Acquire);
+    if head.saturating_sub(*tail) > RING as u64 {
+        *tail = head - RING as u64;
+    }
+    let mut line = crate::model::Line::<64>::new();
+    while *tail < head {
+        let slot = &FRAMES[(*tail % RING as u64) as usize];
+        if slot.seq.load(Ordering::Acquire) != *tail + 1 {
+            break;
+        }
+        let a = slot.a.load(Ordering::Relaxed);
+        *tail += 1;
+        line.clear();
+        let _ = writeln!(line, "{}\t{}\t{}", a as u32, a >> 32 & 0xff, a >> 40);
+        emit(line.as_bytes());
+    }
+}
+
 /// The dumped code, once it is ready.
 pub fn dump() -> Option<&'static [u8]> {
     DUMP_READY

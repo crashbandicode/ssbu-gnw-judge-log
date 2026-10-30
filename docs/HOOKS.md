@@ -33,6 +33,22 @@ value changes; the value it replaced is the number the draw excluded. The
 animation G&W then plays (`special_s_1` to `special_s_9`) matched the logged
 number in every Eden row.
 
+## How the number is drawn (G&W's script, 13.0.5)
+
+Read from a dump of `lua2cpp_gamewatch`'s code around the draw (Eden,
+2026-10-29, `diag` build): for each panel 0..8 the script takes a weight from
+`param_special_s` (1 for every panel in vanilla), 0 for the previous panel,
+and 0 for panel 7 while `SPECIAL_S_PANEL_7_INVALID_FRAME` > 0; it draws
+`r = sv_math::rand(hash40("fighter"), total weight)` and picks the first panel
+whose running total exceeds `r`. Nine more `sv_math::rand(fighter, 100)` draws
+follow in the same frame. `sv_math::rand` (`.text+0x2275320`) steps stream 1
+of the RNG manager (`*(*(.text+0x52c35b0))`, 20-byte xorshift128 states) and
+returns the output modulo the range.
+
+At the start of each G&W frame the plugin copies that stream's state and
+computes the number a side special started then would show (`predicted`).
+The copy is plain memory reads; the game's stream is never stepped.
+
 ## Why it is safe online
 
 The online check compares only how often each of the game's checked RNG
@@ -49,6 +65,7 @@ with only the desync detector, then with the detector and this plugin.
 | Pikachu vs Wolf | reads every fighter (before the G&W gate) | 12,640 + 2,355 | identical check values and positions |
 | G&W vs Captain Falcon, Umbra Clock Tower | gated | 15,374 | identical |
 | Pikachu vs Wolf | gated (no G&W: only the install line in `plugin.log`) | 12,640 | identical |
+| G&W vs Captain Falcon, Umbra Clock Tower | reads the fighter RNG stream every G&W frame (current) | 15,374 | identical |
 
 Live Eden matches against CPUs logged every side special (`special_s` =
 `judges` in `plugin.log`), and every logged number matched G&W's

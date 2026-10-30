@@ -27,6 +27,11 @@ Matches without G&W, or with more than two fighters, leave no trace.
 | `opp_prev*`, `opp_last_move*` | as for G&W |
 | `gw_x`, `gw_y`, `opp_x`, `opp_y`, `distance` | positions and their distance |
 
+| `predicted` | what the plugin computed, before the draw, that this Judge would show |
+| `rng_draw`, `rng_draw_count` | the fighter RNG stream (state, draws so far) at the start of the frame the number was drawn |
+| `rng_before`, `rng_before_count`, `rng_count_after` | the same one frame earlier, and the draw count one frame later |
+| `seven_block` | G&W's "no 7" timer (frames) at the draw frame |
+
 `*_ago` counts frames from the start of that status to the number's frame.
 `*_hit` is what that status's own hitboxes connected with: `hit` beats
 `shield` beats `clank` beats `none`. Projectiles are separate objects and do
@@ -37,6 +42,18 @@ not in the plugin's tables (fighter-specific statuses of other fighters).
 a session, and after each match a `session_end` line per G&W
 (`special_s` = side specials started, `judges` = numbers logged; they match
 unless a side special was cancelled before its number appeared).
+
+# windows.tsv
+
+The 9 windows. A Judge's number is fixed by the fighter RNG stream at the
+moment of the draw (see [HOOKS.md](HOOKS.md)), and that stream only moves when
+fighter code draws from it. So at any frame there is one number a side
+special started then would show. One row per stream state G&W lived through
+in a 1v1: `start_frame`, `frames` it lasted, `predicted` (the number), `nine`,
+`excluded` and `seven_block` (what the draw could not give), `end_draws` (how
+many draws ended it; 0 = the excluded number changed), and the same context
+columns as `judges.tsv` taken on its first frame. The last state of a match is
+not written.
 
 ## Table for statistics
 

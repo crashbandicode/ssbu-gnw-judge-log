@@ -105,6 +105,28 @@ class JudgeTableTest(unittest.TestCase):
                 judge_table.main([str(tmp / 'judges.tsv'), '-o', str(out), '--all-stages'])
             self.assertEqual(len(out.read_text().splitlines()), 1 + 40)
 
+    def test_window_table_flags_only_a_real_bias(self):
+        import window_table
+        rng = random.Random(5)
+        rows = []
+        for i in range(6000):
+            place = rng.choice(['ground', 'air'])
+            excluded = rng.choice([0, 3])
+            allowed = [n for n in range(1, 10) if n != excluded]
+            number = rng.choice(allowed)
+            if place == 'air' and i % 4 == 0:
+                number = 9  # a planted bias
+            rows.append({'frames': '2', 'nine': str(int(number == 9)), 'predicted': str(number),
+                         'excluded': str(excluded), 'seven_block': '0', 'gw_place': place,
+                         'stage': 'battlefield', 'gw_damage': '10', 'opp_damage': '20'})
+        out = io.StringIO()
+        window_table.summary(rows, 30, out)
+        text = out.getvalue()
+        air = next(l for l in text.splitlines() if l.startswith('gw_place') and ' air ' in l)
+        self.assertTrue(air.endswith('*'), text)
+        self.assertAlmostEqual(window_table.p_nine({'excluded': '9', 'seven_block': '0'}), 0.0)
+        self.assertAlmostEqual(window_table.p_nine({'excluded': '3', 'seven_block': '1'}), 1 / 7)
+
     def test_header_matches_the_plugin(self):
         columns = header_columns()
         self.assertEqual(columns[:4], ['boot', 'session', 'frame', 'number'])

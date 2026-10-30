@@ -35,6 +35,8 @@ const TICKS_PER_SECOND: u64 = 19_200_000;
 const SESSION_GAP_TICKS: u64 = 5 * TICKS_PER_SECOND;
 const WRITER_STACK: usize = 32 * 1024;
 const OPEN_WRITE_APPEND: i32 = 2 | 4;
+/// windows.tsv rotates to windows.previous.tsv past this size.
+const WINDOWS_LIMIT: i64 = 64 << 20;
 
 /// Counts calls into the heap. Nothing in the plugin is meant to make one.
 struct CountingAllocator;
@@ -403,6 +405,12 @@ unsafe fn gnw_judge_fighter_frame(ctx: &InlineCtx) {
     if read_u32(fighter + OBJECT_ID as u64) != id_from_entry(entry as i32) {
         return;
     }
+    #[cfg(feature = "diag")]
+    diag::note_frame(
+        session,
+        entry,
+        fighter_rng().map_or(u32::MAX, |rng| rng.count),
+    );
     if FIRST_SEEN.swap(1, Ordering::AcqRel) == 0 {
         push_note(
             NOTE_FIRST,
@@ -658,6 +666,12 @@ fn append_file(name: &str, bytes: &[u8]) {
     }
 }
 
+fn delete(path: &mut Path) {
+    if let Some(path) = path.with_nul() {
+        unsafe { nn::fs::DeleteFile(path.as_ptr()) };
+    }
+}
+
 fn append_log(bytes: &[u8]) {
     if let Some(mut log) = NxFile::append(&mut path(format_args!("{DATA_DIR}/plugin.log"))) {
         log.write(bytes);
@@ -680,6 +694,20 @@ fn append_segments(bytes: &[u8]) {
     let Some(mut file) = NxFile::append(&mut path(format_args!("{DATA_DIR}/windows.tsv"))) else {
         return;
     };
+    if file.offset + bytes.len() as i64 > WINDOWS_LIMIT {
+        // Keep two files at most: windows.tsv becomes windows.previous.tsv.
+        drop(file);
+        let mut current = path(format_args!("{DATA_DIR}/windows.tsv"));
+        let mut previous = path(format_args!("{DATA_DIR}/windows.previous.tsv"));
+        delete(&mut previous);
+        if let (Some(from), Some(to)) = (current.with_nul(), previous.with_nul()) {
+            unsafe { nn::fs::RenameFile(from.as_ptr(), to.as_ptr()) };
+        }
+        let Some(fresh) = NxFile::append(&mut current) else {
+            return;
+        };
+        file = fresh;
+    }
     if file.offset == 0 && !(file.write(SEGMENT_HEADER.as_bytes()) && file.write(b"\n")) {
         return;
     }
@@ -737,6 +765,8 @@ struct Writer {
     #[cfg(feature = "diag")]
     draw_tail: u64,
     #[cfg(feature = "diag")]
+    frame_tail: u64,
+    #[cfg(feature = "diag")]
     dump_written: bool,
     note_tail: u64,
     reported: u32,
@@ -766,6 +796,18 @@ impl Writer {
         });
         if used > 0 {
             append_file("draws.tsv", &batch[..used]);
+        }
+        used = 0;
+        diag::drain_frames(&mut self.frame_tail, |line| {
+            if used + line.len() > batch.len() {
+                append_file("frames.tsv", &batch[..used]);
+                used = 0;
+            }
+            batch[used..used + line.len()].copy_from_slice(line);
+            used += line.len();
+        });
+        if used > 0 {
+            append_file("frames.tsv", &batch[..used]);
         }
         if !self.dump_written {
             if let Some(code) = diag::dump() {
@@ -997,6 +1039,8 @@ extern "C" fn writer_main(_: *mut skyline::libc::c_void) {
         segment_tail: 0,
         #[cfg(feature = "diag")]
         draw_tail: 0,
+        #[cfg(feature = "diag")]
+        frame_tail: 0,
         #[cfg(feature = "diag")]
         dump_written: false,
         note_tail: 0,
