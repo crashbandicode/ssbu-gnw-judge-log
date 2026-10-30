@@ -1,5 +1,6 @@
-"""Tests for judge_table.py: python3 -I -m unittest discover -s tools"""
+"""Tests for the tools here: python3 -I -m unittest discover -s tools"""
 import contextlib
+import csv
 import io
 import random
 import sys
@@ -133,6 +134,65 @@ class JudgeTableTest(unittest.TestCase):
         for column in judge_table.CONTEXTS:
             if not column.endswith('_bin'):
                 self.assertIn(column, columns)
+
+    def test_match_report_checks_forward_steps(self):
+        import match_report
+        state = (0x12345678, 0x9ABCDEF0, 0x0FEDCBA9, 0x87654321)
+        lines, count = [], 100
+        for frame in range(6):
+            lines.append(f'1\t0\t{frame}\t{count}\t' + ':'.join(f'{v:08x}' for v in state))
+            for _ in range(frame % 3):
+                state = match_report.step(state)
+            count += frame % 3
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'frames.tsv'
+            path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+            self.assertEqual(match_report.check_frames(path), (6, 3, [], 0, 0))
+            # a state the stream could not have reached by stepping
+            tail = '00000000' if not lines[-1].endswith('00000000') else 'ffffffff'
+            lines[-1] = lines[-1][:-8] + tail
+            path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+            self.assertEqual(len(match_report.check_frames(path)[2]), 1)
+
+    def test_match_report_landing_event(self):
+        import match_report
+        self.assertEqual(match_report.landing({'gw_status': 'wait', 'gw_status_ago': '5',
+                                               'opp_status': 'attack', 'opp_status_ago': '2'}),
+                         'nothing_visible')
+        self.assertEqual(match_report.landing({'gw_status': 'damage_fly', 'gw_status_ago': '0',
+                                               'opp_status': 'guard_on', 'opp_status_ago': '1'}),
+                         'gw_is_hit+shield')
+
+    def test_match_report_pools_runs(self):
+        import match_report
+        rng = random.Random(9)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            runs = []
+            for run in ('r1', 'r2'):
+                folder = tmp / run / 'ssbu-gnw-judge-log'
+                folder.mkdir(parents=True)
+                rows = []
+                for i in range(300):
+                    excluded = rng.choice([0, 4])
+                    number = rng.choice([n for n in range(1, 10) if n != excluded])
+                    rows.append({'session': '1', 'start_frame': str(3 * i), 'frames': '3',
+                                 'predicted': str(number), 'nine': str(int(number == 9)),
+                                 'excluded': str(excluded), 'seven_block': '0', 'end_draws': '1',
+                                 'stage': 'end', 'opp_fighter': 'mario', 'gw_status': 'wait',
+                                 'gw_status_ago': '9', 'opp_status': 'wait', 'opp_status_ago': '9',
+                                 'gw_damage': '0', 'opp_damage': '0'})
+                with open(folder / 'windows.tsv', 'w', newline='', encoding='utf-8') as handle:
+                    writer = csv.DictWriter(handle, fieldnames=list(rows[0]), delimiter='\t')
+                    writer.writeheader()
+                    writer.writerows(rows)
+                runs.append(str(tmp / run))
+            out = io.StringIO()
+            match_report.report(runs, out)
+            text = out.getvalue()
+            self.assertIn('pooled: 600 states', text)
+            self.assertIn('on 2 matches', text)
+            self.assertIn('nothing_visible', text)
 
 
 if __name__ == '__main__':

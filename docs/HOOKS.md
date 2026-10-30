@@ -49,6 +49,18 @@ At the start of each G&W frame the plugin copies that stream's state and
 computes the number a side special started then would show (`predicted`).
 The copy is plain memory reads; the game's stream is never stepped.
 
+Checked in Eden (2026-10-29/30): `predicted` matched 80 of 84 Judges over 16
+matches. In each of the four misses the frame held 11 fighter draws instead
+of the Judge's own 10, so another fighter's draw came between the plugin's
+copy at the start of the frame and the Judge's draw (when the extra draw
+comes after it, the prediction still holds). The `diag` build also logged
+the stream's full state at the start of every fighter's frame in ten matches
+(74,088 rows, 9,253 changes): every change was the stream stepped forward,
+never reset or written. How often it moves depends on the opponent: about 25
+times a second against Toon Link, Richter, Ganondorf, Ryu, Shulk, Ike, Zelda,
+Donkey Kong, Snake or Joker, about once every two seconds against Yoshi,
+Mewtwo, Lucas, Pichu or Pac-Man.
+
 ## Why it is safe online
 
 The online check compares only how often each of the game's checked RNG

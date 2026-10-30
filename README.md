@@ -45,16 +45,27 @@ G&W is KO'd), so a fair draw gives a 9 one time in 8.
 A Judge's number is fixed by the game's fighter RNG stream at the moment of
 the draw (read from G&W's own script; [docs/HOOKS.md](docs/HOOKS.md)). The
 plugin computes, every frame, what a side special started then would show:
-the `predicted` column matched 34 of 35 Judges in Eden before they happened,
+the `predicted` column matched 80 of 84 Judges in Eden before they happened
+(in the four misses another fighter's draw landed in the same frame first),
 and `windows.tsv` records every state with its number and context.
 
-The stream changes whenever fighter code draws from it (about every 2 frames
-in a fight), and each new state is a fair pick. Across six Eden matches (6,468
-states) no context predicted a 9 beyond chance:
+The stream moves whenever fighter code draws from it, and each new state is
+a fair pick. Over 15 Eden matches on Final Destination against CPUs (ten of
+them under a tournament ruleset: 3 stock, items off, level 9; 12,948 states)
+no context predicted a 9 beyond chance: 300 groups tested, none significant
+after correction; the per-match 9 counts spread as a fair draw's do; what was
+visible on the frame a state began on (a hit, a KO, a shield, a Judge,
+nothing) made no difference. A replay of a human match (7,186 states) was
+fair too.
 
 ```text
 python3 tools/window_table.py windows.tsv
+python3 tools/match_report.py <run folders>
 ```
+
+How often the stream moves depends on the opponent: about 25 times a second
+against most fighters, about once every 2 seconds against Yoshi, Mewtwo,
+Lucas, Pichu and Pac-Man. The odds per state are the same either way.
 
 What does hold, from the formula: 0 % right after a 9, 1/9 with nothing
 excluded (first Judge of a match, after G&W is KO'd), 1/8 normally, 1/7 within

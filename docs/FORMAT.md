@@ -53,9 +53,18 @@ in a 1v1: `start_frame`, `frames` it lasted, `predicted` (the number), `nine`,
 `excluded` and `seven_block` (what the draw could not give), `end_draws` (how
 many draws ended it; 0 = the excluded number changed), and the same context
 columns as `judges.tsv` taken on its first frame. The last state of a match is
-not written.
+not written. States on the results screen carry stage `resultstage`; the
+scripts below leave them out.
 
-## Table for statistics
+# frames.tsv and draws.tsv (diag build only)
+
+The `diag` cargo feature (Eden only, never shipped) adds `frames.tsv`, one
+line per fighter frame start while G&W plays: `session entry frame count
+x:y:z:w`, the fighter RNG stream's draw count and full state (count
+4294967295 when it could not be read). `draws.tsv` lists every
+`sv_math::rand(fighter, n)` call: `session count n caller`.
+
+## Tables for statistics
 
 ```text
 python3 tools/judge_table.py <judges.tsv or folders>... -o judges.csv
@@ -67,3 +76,22 @@ distance, and `p_nine` (a fair draw's chance of a 9 for that row: 1/8, 0 when
 9 is excluded, 1/9 when nothing is), then prints the 9 rate per context
 against that expectation. Only tournament-legal stages are kept unless
 `--all-stages` is given; the list is `LEGAL_STAGES` at the top of the script.
+
+```text
+python3 tools/window_table.py <windows.tsv or folders>...
+```
+
+The same per context for the 9 windows: every stream state against the
+fair chance of its `predicted` being a 9, Bonferroni-corrected over the
+groups tested.
+
+```text
+python3 tools/match_report.py <run folders>...
+```
+
+One line per match (a folder with the three files): stage, opponent, how
+often the stream moved, 9 states against a fair draw by state and by frame,
+Judges predicted, and from `frames.tsv` whether every change of the stream
+was a forward step of the xorshift. Then pooled: the spread of per-match 9
+counts against a fair draw and the 9 share by what was visible on the frame
+each state began on (a hit, a KO, a shield, a Judge, nothing).
